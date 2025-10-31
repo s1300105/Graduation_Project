@@ -1,0 +1,103 @@
+# ===============================
+# Python / PyTorch
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+*.log
+
+# Virtual environments
+venv/
+.env/
+env/
+.venv/
+ENV/
+pip-wheel-metadata/
+
+# PyTorch checkpoints / model weights
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+
+# Dataset and embeddings
+data/raw/
+data/cpg/
+data/input/
+data/tokens/
+data/joern/
+*.pkl
+*.jsonl
+*.csv
+*.npz
+
+# ===============================
+# Joern & Edge Processing
+# ===============================
+joern-cli/
+Edge_processing/
+*.cpg
+*.dot
+*.json.gz
+*.odb
+*.bin
+
+# ===============================
+# Logs / cache
+# ===============================
+*.log
+*.out
+*.err
+logs/
+wandb/
+lightning_logs/
+tensorboard/
+.cache/
+__cache__/
+output/
+outputs/
+
+# ===============================
+# IDE / Editor
+# ===============================
+# VS Code
+.vscode/
+.history/
+.settings/
+*.code-workspace
+
+# PyCharm
+.idea/
+
+# ===============================
+# OS / System
+# ===============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===============================
+# Jupyter / Colab
+# ===============================
+.ipynb_checkpoints/
+*.ipynb_save
+*.ipynb_export
+
+# ===============================
+# Temporary / Experimental files
+# ===============================
+tmp/
+temp/
+experiments/
+runs/
+checkpoints/
+data/data_review.ipynb
