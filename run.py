@@ -3,6 +3,7 @@ import utils.data as data
 import utils.process as process
 import shutil
 import gc
+import pandas as pd
 
 
 PATHS = configs.Paths()
@@ -14,7 +15,7 @@ def select(dataset):
     result = dataset.loc[dataset['project'] == "qemu"] #select data from only qemu project
     len_filter = result.func.str.len() < 1200
     result = result.loc[len_filter]
-    result = result.head(200) # For debug, only 200 samples is extracted.
+    result = result.head(1000) # For debug, only 200 samples is extracted.
     
     return result
 
@@ -45,10 +46,17 @@ def CPG_generator():
     json_files = process.joern_create(context.joern_cli_dir, PATHS.cpg, PATHS.cpg, cpg_files)
     for (s, slice), json_file in zip(slices, json_files):
         graphs = process.json_process(PATHS.cpg, json_file)
-        if graphs is None:
+        if not graphs:
             print(f"Dataset chunk {s} not processed.")
             continue
-        dataset = data.create_with_index(graphs, ["Index", "cpg"])
+
+        # graphs: List[Tuple[int, dict]] -> DataFrame へ
+        df_graphs = pd.DataFrame(graphs, columns=["Index", "cpg"])
+        df_graphs["Index"] = df_graphs["Index"].astype(int)
+
+        # ここで初めて create_with_index に渡す
+        dataset = data.create_with_index(df_graphs, ["Index", "cpg"])
+
         dataset = data.inner_join_by_index(slice, dataset)
         print(f"Writting cpg dataset chunk {s}.")
         data.write(dataset, PATHS.cpg, f"{s}_{FILES.cpg}.pkl")
