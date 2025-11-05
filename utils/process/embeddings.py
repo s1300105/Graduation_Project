@@ -1,37 +1,49 @@
+import os
 import numpy as np
 import torch
 from torch_geometric.data import Data
 from utils.functions import tokenizer  # 使わないなら消してOK
 from utils.functions import log as logger
-from transformers import RobertaTokenizer, RobertaModel
+from torch_geometric.utils import add_self_loops
+
+# transformers の import は遅延ロード（fastモード時に無駄に読み込まない）
+try:
+    from transformers import RobertaTokenizer, RobertaModel
+except Exception:
+    RobertaTokenizer = None
+    RobertaModel = None
+
 
 class NodesEmbedding:
+    """
+    Node特徴を作るクラス。
+    - mode="codebert": CodeBERT (CLS) を使う本番モード
+    - mode="fast"    : 形状を維持したダミー特徴（超高速・検証用）
+    """
     def __init__(
         self,
         nodes_dim: int,
         *,
-        max_len: int = 128,      # ← ここを短くするとさらに省メモリ（64/96/128）
-        batch_size: int = 32,    # ← OOMなら16/8へ
-        dtype=torch.float16      # ← GPUならfp16、CPUなら自動でfp32に落ちる
+        max_len: int = 128,
+        batch_size: int = 32,
+        dtype=torch.float16,
+        mode: str = "codebert",  # ★ 追加
     ):
         self.nodes_dim = int(nodes_dim)
         assert self.nodes_dim >= 0
 
+        # 環境変数で fast を強制（例：USE_FAST_NODES_EMBEDDING=1）
+        env_fast = os.environ.get("USE_FAST_NODES_EMBEDDING", "").strip() in {"1", "true", "True"}
+        if env_fast:
+            mode = "fast"
+        self.mode = mode
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
 
-        # HuggingFace
-        self.tokenizer_bert = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
-        self.bert_model = RobertaModel.from_pretrained(
-            "microsoft/codebert-base",
-            dtype=dtype if self.device.type == "cuda" else None,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
-        self.bert_model.eval()  # 推論モード
-
-        self.bert_dim = self.bert_model.config.hidden_size  # 768
-        self.feat_dim = 1 + self.bert_dim                   # [type_id | CLS(768)]
-
+        # 共通: 出力形状は [type_id(1) + 768] = 769
+        self.bert_dim = 768
+        self.feat_dim = 1 + self.bert_dim
         # パディング用バッファ（CPU, fp32）
         self.target = torch.zeros(self.nodes_dim, self.feat_dim, dtype=torch.float32)
 
@@ -39,12 +51,31 @@ class NodesEmbedding:
         self.max_len = int(max_len)
         self.batch_size = int(batch_size)
 
-        # 同一コード再計算回避のキャッシュ
+        # CodeBERT モードのみ重い初期化
         self._cache = {}
+        self._is_codebert = (self.mode == "codebert")
+        if self._is_codebert:
+            if RobertaTokenizer is None or RobertaModel is None:
+                raise RuntimeError("transformers が読み込めません。fastモードを使用するか、transformers をインストールしてください。")
+            # HF の新APIは dtype 推奨（古い torch_dtype は非推奨）
+            self.tokenizer_bert = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
+            self.bert_model = RobertaModel.from_pretrained(
+                "microsoft/codebert-base",
+                dtype=dtype if self.device.type == "cuda" else None,
+                low_cpu_mem_usage=True,
+            ).to(self.device)
+            self.bert_model.eval()
+        else:
+            # fastモードはモデルを持たない
+            self.tokenizer_bert = None
+            self.bert_model = None
 
     def __call__(self, nodes):
-        emb_np = self.embed_nodes(nodes)                 # np.array [N, feat_dim]
-        nodes_tensor = torch.from_numpy(emb_np).float()  # CPU, fp32
+        if self._is_codebert:
+            emb_np = self._embed_nodes_codebert(nodes)     # np.array [N, feat_dim]
+        else:
+            emb_np = self._embed_nodes_fast(nodes)         # np.array [N, feat_dim]
+        nodes_tensor = torch.from_numpy(emb_np).float()    # CPU, fp32
 
         # 前回より短いグラフが来た時に残りが汚れないようゼロ埋め
         self.target.zero_()
@@ -54,8 +85,39 @@ class NodesEmbedding:
 
         return self.target
 
+    # ========= fastモード =========
+    def _embed_nodes_fast(self, nodes):
+        """
+        CodeBERTを使わず、先頭数次元のみ簡単な決定的特徴で埋めた [N,769] を返す。
+        [0]=type_id, [1]=len(code), [2]=line, [3]=column, [4]=hash(code[:4])
+        残りは0。
+        """
+        node_items = list(nodes.items())
+        N = len(node_items)
+        out = np.zeros((N, self.feat_dim), dtype=np.float32)
+        for i, (_, node) in enumerate(node_items):
+            code = node.get_code() or ""
+            type_id = getattr(node, "type", 0)
+            # line/column の取り方は実装に合わせて安全に
+            try:
+                line = node.get_line_number() or 0
+            except Exception:
+                line = getattr(node, "line_number", 0) or 0
+            try:
+                col = node.get_column_number() or 0
+            except Exception:
+                col = getattr(node, "column_number", 0) or 0
+
+            out[i, 0] = float(type_id)
+            out[i, 1] = float(len(code))
+            out[i, 2] = float(line)
+            out[i, 3] = float(col)
+            h = int.from_bytes(code.encode("utf-8")[:4].ljust(4, b"\0"), "little")
+            out[i, 4] = float(h % 1_000_003)
+        return out
+
+    # ========= CodeBERTモード =========
     def _batch_encode(self, texts):
-        # 直接HuggingFaceのtokenizerに通す：余計な中間テンソルを作らない
         return self.tokenizer_bert(
             texts,
             return_tensors="pt",
@@ -64,49 +126,35 @@ class NodesEmbedding:
             max_length=self.max_len,
         )
 
-    def embed_nodes(self, nodes):
-        # 入力整形（リスト化）
+    def _embed_nodes_codebert(self, nodes):
         node_items = list(nodes.items())
-        codes = []
-        type_ids = []
+        codes, type_ids = [], []
         for _, node in node_items:
             code = node.get_code()
             codes.append(code if isinstance(code, str) else str(code))
             type_ids.append(getattr(node, "type", 0))
 
         feats = []
-        # 勾配も中間も完全OFF
         with torch.inference_mode():
             for i in range(0, len(codes), self.batch_size):
                 batch_codes = codes[i: i + self.batch_size]
 
                 # キャッシュミスだけ推論
-                miss_positions = []
-                miss_texts = []
-                for j, c in enumerate(batch_codes):
-                    if c not in self._cache:
-                        miss_positions.append(j)
-                        miss_texts.append(c)
-
+                miss_texts = [c for c in batch_codes if c not in self._cache]
                 if miss_texts:
                     enc = self._batch_encode(miss_texts)
                     enc = {k: v.to(self.device, non_blocking=True) for k, v in enc.items()}
-
                     if self.device.type == "cuda":
-                        # 半精度で前向き
                         with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
-                            hidden = self.bert_model(**enc).last_hidden_state  # [B, L, H]
+                            hidden = self.bert_model(**enc).last_hidden_state  # [B,L,H]
                     else:
                         hidden = self.bert_model(**enc).last_hidden_state
-
-                    cls = hidden[:, 0]                         # [B, H]
-                    cls_np = cls.detach().cpu().numpy()        # 即CPUへ
-
+                    cls = hidden[:, 0]                         # [B,H]
+                    cls_np = cls.detach().cpu().numpy()
                     # キャッシュへ保存
-                    for j, c in zip(range(len(miss_positions)), miss_texts):
+                    for j, c in enumerate(miss_texts):
                         self._cache[c] = cls_np[j]
-
-                    # 一時テンソルを開放
+                    # 一時テンソル開放
                     del enc, hidden, cls
                     if self.device.type == "cuda":
                         torch.cuda.empty_cache()
@@ -116,12 +164,15 @@ class NodesEmbedding:
                     feats.append(self._cache[c])
 
         feats = np.stack(feats, axis=0).astype(np.float32)          # [N, 768]
-        type_arr = np.asarray(type_ids, dtype=np.float32).reshape(-1, 1)  # [N, 1]
+        type_arr = np.asarray(type_ids, dtype=np.float32).reshape(-1, 1)
         emb = np.concatenate([type_arr, feats], axis=1)             # [N, 1+768]
         return emb
 
 
 class GraphsEmbedding:
+    """
+    ※ 旧・単関係用。多関係は下の build_edges_all を使用推奨。
+    """
     def __init__(self, edge_type):
         self.edge_type = edge_type
 
@@ -134,34 +185,71 @@ class GraphsEmbedding:
         for node_idx, (node_id, node) in enumerate(nodes.items()):
             if node_idx != node.order:
                 raise Exception("Something wrong with the order")
-
             for _, edge in node.edges.items():
                 if edge.type != self.edge_type:
                     continue
-
                 if edge.node_in in nodes and edge.node_in != node_id:
                     coo[0].append(nodes[edge.node_in].order)
                     coo[1].append(node_idx)
-
                 if edge.node_out in nodes and edge.node_out != node_id:
                     coo[0].append(node_idx)
                     coo[1].append(nodes[edge.node_out].order)
         return coo
 
 
-def nodes_to_input(nodes, target, nodes_dim, edge_type):
-    # 省メモリ設定はここで調整可能（必要なら configs へ）
+EDGE_MAP = {
+    "AST":0, "AST_EDGE":0,
+    "CFG":1, "CFG_EDGE":1,
+    "PDG":2, "REACHING_DEF":2, "DATA_FLOW":2, "DDG":2,
+    # 必要ならここに追記
+}
+
+def build_edges_all(nodes):
+    src, dst, et = [], [], []
+    for _, node in nodes.items():
+        u = node.order
+        for _, e in (node.edges or {}).items():
+            t = e.type
+            if t not in EDGE_MAP:
+                continue
+            if e.node_in in nodes and nodes[e.node_in].order != u:
+                src.append(nodes[e.node_in].order); dst.append(u);  et.append(EDGE_MAP[t])
+            if e.node_out in nodes and nodes[e.node_out].order != u:
+                src.append(u); dst.append(nodes[e.node_out].order); et.append(EDGE_MAP[t])
+    if not src:
+        return torch.empty((2,0), dtype=torch.long), torch.empty((0,), dtype=torch.long)
+    return torch.tensor([src, dst], dtype=torch.long), torch.tensor(et, dtype=torch.long)
+
+
+def nodes_to_input(nodes, target, nodes_dim, *, mode: str = "codebert"):
+    """
+    nodes: OrderedDict[node_id -> node]
+    target: int/float
+    nodes_dim: 最大ノード数（パディング幅）
+    mode: "codebert" | "fast"  ← ★ ここで切替（検証時は "fast" 推奨）
+    """
     nodes_embedding = NodesEmbedding(
         nodes_dim,
-        max_len=128,     # 64/96/128 などで調整
-        batch_size=32,   # OOMなら16→8
-        dtype=torch.float16
+        max_len=128,
+        batch_size=32,
+        dtype=torch.float16,
+        mode=mode,  # ★ 追加
     )
-    graphs_embedding = GraphsEmbedding(edge_type)
-    label = torch.tensor([target]).float()
+    x = nodes_embedding(nodes)  # [nodes_dim, 1+768] 先頭n行が実ノード、残りは0埋め
+    n_real = min(len(nodes), nodes_dim)
 
-    return Data(
-        x=nodes_embedding(nodes),                  # [nodes_dim, 1+768] (CPU, fp32)
-        edge_index=graphs_embedding(nodes),        # COO
-        y=label
+    edge_index, edge_type = build_edges_all(nodes)
+
+    # エッジ0本のときは自己ループでフォールバック
+    if edge_index.numel() == 0:
+        edge_index, _ = add_self_loops(edge_index, num_nodes=n_real)
+        edge_type = torch.zeros(edge_index.size(1), dtype=torch.long)
+
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+        edge_type=edge_type,
+        y=torch.tensor([float(target)], dtype=torch.float32),
     )
+    data.num_nodes = n_real  # 実ノード数を明示
+    return data
