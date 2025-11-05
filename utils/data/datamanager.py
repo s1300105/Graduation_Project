@@ -3,6 +3,8 @@ import numpy as np
 import os
 import json
 from pathlib import Path
+import glob
+from ..functions import parse
 
 def read(path, json_file):
     fp = str(Path(path) / json_file)
@@ -30,7 +32,12 @@ def read(path, json_file):
             return pd.DataFrame(rows)
 
 def write(data_frame: pd.DataFrame, path, file_name):
-    data_frame.to_pickle(path + file_name)
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)  # ディレクトリが無ければ作成
+
+    out_path = p / file_name              # 安全なパス結合
+    data_frame.to_pickle(out_path)
+    print(f"[INFO] Saved: {out_path}")
 
 def apply_filter(data_frame: pd.DataFrame, filter_func):
     return filter_func(data_frame)
@@ -81,3 +88,23 @@ def create_with_index(data_frame, columns):
 
 def inner_join_by_index(df1, df2):
     return pd.merge(df1, df2, left_index=True, right_index=True)
+
+def get_directory_files(directory):
+    return [os.path.basename(file) for file in glob.glob(f"{directory}/*.pkl")]
+
+def get_ratio(dataset, ratio):
+    approx_size = int(len(dataset) * ratio)
+    return dataset[:approx_size]
+
+def load(path, pickle_file, ratio=1):
+    dataset = pd.read_pickle(path + pickle_file)
+    dataset.info(memory_usage='deep')
+    if ratio < 1:
+        dataset = get_ratio(dataset, ratio)
+    
+    return dataset
+
+def tokenize(data_frame: pd.DataFrame):
+    data_frame["tokens"] = data_frame["func"].apply(parse.tokenizer)
+    return data_frame[["tokens", "func"]]
+

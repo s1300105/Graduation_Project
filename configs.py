@@ -79,3 +79,14 @@ class Files(Data):
     def tokens(self):
         return self.get_property('tokens')
     
+class Embed(Config):
+    def __init__(self):
+        super().__init__('embed')
+    
+    @property
+    def nodes_dim(self):
+        return self.get_property('nodes_dim')
+    
+    @property
+    def edge_type(self):
+        return self.get_property('edge_type')
