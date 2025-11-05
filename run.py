@@ -4,6 +4,9 @@ import utils.process as process
 import shutil
 import gc
 import pandas as pd
+import utils.process as process
+import utils.functions.cpg_dir as cpg
+from utils.functions.cpg import parse_to_nodes
 
 
 PATHS = configs.Paths()
@@ -63,8 +66,29 @@ def CPG_generator():
         del dataset
         gc.collect()
 
-    
+def Embed_generator():
+    """
+    Generates embeddings from Code Property Graph (CPG) datasets.
+    : return None
+    """
+    context = configs.Embed()
+    dataset_files = data.get_directory_files(PATHS.cpg)
 
+    for pkl_file in dataset_files:
+        file_name = pkl_file.split(".")[0]
+        cpg_dataset = data.load(PATHS.cpg, pkl_file)
+        tokens_dataset = data.tokenize(cpg_dataset)
+        data.write(tokens_dataset, PATHS.tokens, f"{file_name}_{FILES.tokens}")
+
+        cpg_dataset["nodes"] = cpg_dataset.apply(lambda row: parse_to_nodes(row.cpg, context.nodes_dim), axis=1)
+        cpg_dataset["input"] = cpg_dataset.apply(lambda row: process.nodes_to_input(row.nodes, row.target, context.nodes_dim, context.edge_type), axis=1)
+        data.drop(cpg_dataset, ["nodes"])
+        print(f"Saving input dataset {file_name} with size {len(cpg_dataset)}.")
+        
+        data.write(cpg_dataset[["input", "target", "func"]], PATHS.input, f"{file_name}_{FILES.input}")
+
+        del cpg_dataset
+        gc.collect()
 
 
 

@@ -6,12 +6,12 @@
         "model": {
             "gated_graph_conv_args": {"out_channels" : 200, "num_layers" : 6, "aggr" : "add", "bias": true},
             "conv_args": {
-                "conv1d_1" : {"in_channels": 205, "out_channels": 50, "kernel_size": 3, "padding" : 1},
+                "conv1d_1" : {"in_channels": 500, "out_channels": 50, "kernel_size": 3, "padding" : 1},
                 "conv1d_2" : {"in_channels": 50, "out_channels": 20, "kernel_size": 1, "padding" : 1},
                 "maxpool1d_1" : {"kernel_size" : 3, "stride" : 2},
                 "maxpool1d_2" : {"kernel_size" : 2, "stride" : 2}
             },
-            "emb_size" : 101
+            "emb_size" : 769
         }
     },
     "create" : {
@@ -34,7 +34,7 @@
         "input" : "input.pkl"
     },
     "embed" : {
-        "nodes_dim" : 205,
+        "nodes_dim" : 500,
         "edge_type": "Cpg"
     },
     "process" : {
