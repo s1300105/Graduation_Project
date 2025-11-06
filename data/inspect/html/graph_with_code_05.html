@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Graph &amp; Code #5</title>
+<style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin:0; }
+    .wrap { display:flex; gap:10px; padding:10px; }
+    .pane { flex:1; border:1px solid #ddd; border-radius:8px; padding:8px; overflow:auto; max-height:88vh; }
+    table.codebox { border-collapse: collapse; width: 100%; }
+    td.ln { width: 3.5em; color:#888; text-align:right; padding-right:8px; vertical-align: top; user-select:none; }
+    td.code { white-space: pre; }
+    h3 { margin: 6px 0 10px; }
+    .legend { margin-bottom: 6px; font-size: 12px; }
+    .chip { display:inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }
+    tr.code-row.hl > td.code { outline: 2px solid #ff9800; background: #fff3e0 !important; }
+    </style></head>
+<body>
+  <div class="wrap">
+    <div class='pane'><h3>Function Source</h3><table class='codebox'><tr>  <td class='ln'>1</td>  <td class='code' style=''>void pcie_aer_inject_error_print(Monitor *mon, const QObject *data)</td></tr><tr>  <td class='ln'>2</td>  <td class='code' style=''>{</td></tr><tr>  <td class='ln'>3</td>  <td class='code' style=''>    QDict *qdict;</td></tr><tr>  <td class='ln'>4</td>  <td class='code' style=''>    int devfn;</td></tr><tr>  <td class='ln'>5</td>  <td class='code' style=''>    assert(qobject_type(data) == QTYPE_QDICT);</td></tr><tr>  <td class='ln'>6</td>  <td class='code' style=''>    qdict = qobject_to_qdict(data);</td></tr><tr>  <td class='ln'>7</td>  <td class='code' style=''> </td></tr><tr>  <td class='ln'>8</td>  <td class='code' style=''>    devfn = (int)qdict_get_int(qdict, &quot;devfn&quot;);</td></tr><tr>  <td class='ln'>9</td>  <td class='code' style=''>    monitor_printf(mon, &quot;OK id: %s root bus: %s, bus: %x devfn: %x.%x\n&quot;,</td></tr><tr>  <td class='ln'>10</td>  <td class='code' style=''>                   qdict_get_str(qdict, &quot;id&quot;),</td></tr><tr>  <td class='ln'>11</td>  <td class='code' style=''>                   qdict_get_str(qdict, &quot;root_bus&quot;),</td></tr><tr>  <td class='ln'>12</td>  <td class='code' style=''>                   (int) qdict_get_int(qdict, &quot;bus&quot;),</td></tr><tr>  <td class='ln'>13</td>  <td class='code' style=''>                   PCI_SLOT(devfn), PCI_FUNC(devfn));</td></tr><tr>  <td class='ln'>14</td>  <td class='code' style=''>}</td></tr></table></div>
+    <div class='pane'><h3>Graph</h3><div class='legend'><b>Nodes</b>: </div><div class='legend'><b>Edges</b>: <span class='chip' style='background:#1f77b4'></span> AST <span class='chip' style='background:#ff7f0e'></span> CFG</div><iframe id='graph_iframe' src='graph_with_code_05_pyvis.html' style='width:100%; height:740px; border:0;' sandbox='allow-scripts allow-same-origin'></iframe></div>
+  </div>
+  
+    <script>
+    (function() {
+      const iframe = document.getElementById('graph_iframe');
+      const node2lines = {};
+
+      function setCodeHighlight(nodeIds) {
+        document.querySelectorAll('tr.code-row.hl').forEach(tr => tr.classList.remove('hl'));
+        const lines = new Set();
+        (nodeIds || []).forEach(id => (node2lines[id] || []).forEach(li => lines.add(li)));
+        lines.forEach(li => {
+          const tr = document.getElementById('L' + li);
+          if (tr) tr.classList.add('hl');
+        });
+        // 一番小さい行へスクロール
+        if (lines.size > 0) {
+          const minLine = Math.min.apply(null, Array.from(lines));
+          const tr = document.getElementById('L' + minLine);
+          if (tr) tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+
+      // iframe -> 親：ノード選択通知
+      window.addEventListener('message', (event) => {
+        if (!event.data || !event.data.type) return;
+        if (event.data.type === 'highlight_lines') {
+          setCodeHighlight(event.data.ids || []);
+        }
+      });
+
+      // 親 -> iframe：行ホバーでノード選択
+      function postToIframe(ids) {
+        if (!iframe || !iframe.contentWindow) return;
+        iframe.contentWindow.postMessage({ type: 'highlight_nodes', ids: ids || [] }, '*');
+      }
+
+      // 行ホバーで連動
+      document.querySelectorAll('tr.code-row').forEach(tr => {
+        tr.addEventListener('mouseenter', () => {
+          const s = tr.getAttribute('data-nodes') || '';
+          const ids = s.split(',').filter(Boolean).map(x => parseInt(x));
+          postToIframe(ids);
+          setCodeHighlight(ids);
+        });
+        tr.addEventListener('mouseleave', () => {
+          postToIframe([]);
+          setCodeHighlight([]);
+        });
+      });
+    })();
+    </script>
+    
+</body></html>
