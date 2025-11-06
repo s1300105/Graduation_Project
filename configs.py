@@ -90,3 +90,27 @@ class Embed(Config):
     @property
     def edge_type(self):
         return self.get_property('edge_type')
+    
+class Process(Config):
+    def __init__(self):
+        super().__init__('process')
+
+    @property
+    def epochs(self):
+        return self.get_property('epochs')
+
+    @property
+    def patience(self):
+        return self.get_property('patience')
+
+    @property
+    def batch_size(self):
+        return self.get_property('batch_size')
+
+    @property
+    def dataset_ratio(self):
+        return self.get_property('dataset_ratio')
+
+    @property
+    def shuffle(self):
+        return self.get_property('shuffle')

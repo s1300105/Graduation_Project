@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Graph &amp; Code</title>
+<style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin:0; }
+    .wrap { display:flex; gap:10px; padding:10px; }
+    .pane { flex:1; border:1px solid #ddd; border-radius:8px; padding:8px; overflow:auto; max-height:88vh; }
+    table.codebox { border-collapse: collapse; width: 100%; }
+    td.ln { width: 3.5em; color:#888; text-align:right; padding-right:8px; vertical-align: top; user-select:none; }
+    td.code { white-space: pre; }
+    h3 { margin: 6px 0 10px; }
+    .legend { margin-bottom: 6px; font-size: 12px; }
+    .chip { display:inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }
+    </style></head>
+<body>
+  <div class="wrap">
+    <div class='pane'><h3>Function Source</h3><table class='codebox'><tr>  <td class='ln'>1</td>  <td class='code' style=''>void usb_device_free_streams(USBDevice *dev, USBEndpoint **eps, int nr_eps)</td></tr><tr>  <td class='ln'>2</td>  <td class='code' style=''>{</td></tr><tr>  <td class='ln'>3</td>  <td class='code' style=''>    USBDeviceClass *klass = USB_DEVICE_GET_CLASS(dev);</td></tr><tr>  <td class='ln'>4</td>  <td class='code' style=''>    if (klass-&gt;free_streams) {</td></tr><tr>  <td class='ln'>5</td>  <td class='code' style=''>        klass-&gt;free_streams(dev, eps, nr_eps);</td></tr><tr>  <td class='ln'>6</td>  <td class='code' style=''>    }</td></tr><tr>  <td class='ln'>7</td>  <td class='code' style=''>}</td></tr></table></div>
+    <div class='pane'><h3>Graph</h3><div class='legend'></div><iframe src='graph_with_code_pyvis.html' style='width:100%; height:740px; border:0;' sandbox='allow-scripts allow-same-origin'></iframe></div>
+  </div>
+</body></html>

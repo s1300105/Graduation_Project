@@ -9,6 +9,9 @@ import utils.functions.cpg_dir as cpg
 
 from utils.functions.cpg import parse_to_functions
 from utils.process.embeddings import nodes_to_input
+from utils.data.datamanager import loads, train_val_test_split
+from utils.validate.save_utils import save_split_from_loaders, cache_loader_items, save_loader_sample_json
+from utils.validate.analyze_utils import peek_loader, summarize_generic_loader, summarize_graph_loader, describe_pyg_graph
 
 
 PATHS = configs.Paths()
@@ -95,3 +98,5 @@ def Embed_generator():
         if len(out_df) == 0:
             print("[WARN] No functions parsed from this CPG chunk. Check parser/filter settings.")
         data.write(out_df, PATHS.input, f"{file_name}_{FILES.input}")
+
+
