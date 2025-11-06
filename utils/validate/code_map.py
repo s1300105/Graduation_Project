@@ -92,6 +92,7 @@ def _nx_from_pyg(data):
                 d["edge_type"] = -1
     return G
 
+
 def render_code_and_graph_html(
     data,
     out_html: str = "data/inspect/graph_with_code.html",
@@ -100,14 +101,14 @@ def render_code_and_graph_html(
     title: Optional[str] = None,
 ):
     from pathlib import Path
-    import re, html as _html
+    import json, html as _html
 
     # --- 1) コード ---
     code = getattr(data, "func", None) or ""
     if not code:
         raise ValueError("data.func（関数コード）がありません。")
 
-    # --- 2) node_lines 推定（略） ---
+    # --- 2) node_lines 推定 ---
     N = int(getattr(data, "num_nodes", 0) or 0)
     if node_lines is None:
         node_lines = {}
@@ -137,33 +138,54 @@ def render_code_and_graph_html(
                 e = e if (e is not None and e >= s) else s
                 node_lines[nid] = list(range(s, e + 1))
 
-    # --- 3) 色割り当て ---
-    from .code_map import _pick_palette, _build_code_html, _nx_from_pyg, _build_graph_html  # 再利用
-    color_map = _pick_palette(max(1, len(node_lines)))
+    # --- 3) 色割り当て（ノード） ---
+    from .code_map import _pick_palette, _build_code_html, _nx_from_pyg, _build_graph_html
     node_ids = sorted(node_lines.keys())
-    node2color = {nid: color_map[i % len(color_map)] for i, nid in enumerate(node_ids)}
+    node_palette = _pick_palette(max(1, len(node_lines)))
+    node2color = {nid: node_palette[i % len(node_palette)] for i, nid in enumerate(node_ids)}
 
-        
+    # --- 4) エッジタイプの抽出＆色割り当て ---
+    import torch
+    edge_types_present: List[int] = []
+    if hasattr(data, "edge_type") and getattr(data, "edge_type") is not None:
+        et = getattr(data, "edge_type")
+        try:
+            uniq = torch.unique(et).tolist()
+            edge_types_present = [int(u) for u in uniq]
+        except Exception:
+            pass
+    edge_types_present.sort()
+    if edge_type_labels is None:
+        # 名前が無ければ "etype k" にする
+        edge_type_labels = {k: f"etype {k}" for k in edge_types_present}
+
+    edge_palette = _pick_palette(max(1, len(edge_types_present))) if edge_types_present else []
+    et2color = {k: edge_palette[i % len(edge_palette)] for i, k in enumerate(edge_types_present)}
+
+    # --- 5) PyVis で描画（できなければPNGにフォールバック） ---
     graph_div = None
+    pyvis_ok = False
     try:
         from pyvis.network import Network
-        import jinja2  # 念のため
 
         G = _nx_from_pyg(data)
         net = Network(height="740px", width="100%", directed=False, notebook=False)
         net.barnes_hut()
 
+        # ノード
         for i in G.nodes:
             color = node2color.get(int(i), "#89a")
             net.add_node(int(i), label=str(i), color=color, title=f"node {i}")
 
+        # エッジ（タイプ別に色分け）
         if G.number_of_edges() > 0:
             for u, v, d in G.edges(data=True):
                 et = int(d.get("edge_type", -1))
-                et_name = edge_type_labels.get(et, f"etype {et}") if edge_type_labels else f"etype {et}"
-                net.add_edge(int(u), int(v), title=et_name)
+                et_name = edge_type_labels.get(et, f"etype {et}")
+                ecolor = et2color.get(et, "#999")
+                net.add_edge(int(u), int(v), title=et_name, color=ecolor, width=2)
 
-        # out_html と同じディレクトリに pyvis のファイルを書き出す
+        # ファイル書き出し
         out_path = Path(out_html)
         out_dir = out_path.parent
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -172,15 +194,19 @@ def render_code_and_graph_html(
 
         net.write_html(str(embed_path), notebook=False, open_browser=False)
 
-        # iframe で丸ごと埋め込む（スクリプト・CSSを失わない）
+        # === PyVis 側にブリッジJSを注入（親<->iframe 連携） ===
+        _inject_pyvis_bridge(embed_path)
+
+        # iframe で埋め込む
         graph_div = (
-            f"<iframe src='{embed_name}' "
+            f"<iframe id='graph_iframe' src='{embed_name}' "
             f"style='width:100%; height:740px; border:0;' "
             f"sandbox='allow-scripts allow-same-origin'></iframe>"
         )
+        pyvis_ok = True
 
-    except Exception as e:
-        # pyvis 失敗 → 静的PNGでフォールバック
+    except Exception:
+        # PNG フォールバック
         from .visualize_graph import plot_pyg_graph
         png_path = Path(out_html).with_suffix(".png")
         plot_pyg_graph(
@@ -196,17 +222,24 @@ def render_code_and_graph_html(
         )
         graph_div = f"<img src='{png_path.name}' style='max-width:100%;'>"
 
-
-    # --- 5) 凡例（ノード色） ---
-    legend_items = []
+    # --- 6) 凡例（ノード色 + エッジ色） ---
+    legend_node_items = []
     for nid in node_ids[:30]:
-        legend_items.append(f"<span class='chip' style='background:{node2color[nid]}'></span> {nid}")
-    legend_html = "<div class='legend'>" + " ".join(legend_items) + "</div>"
+        legend_node_items.append(f"<span class='chip' style='background:{node2color[nid]}'></span> {nid}")
+    node_legend_html = "<div class='legend'><b>Nodes</b>: " + " ".join(legend_node_items) + "</div>"
 
-    # --- 6) 左ペイン：コードHTML ---
+    legend_edge_items = []
+    for k in edge_types_present[:30]:
+        title_txt = _html.escape(edge_type_labels.get(k, f"etype {k}"))
+        legend_edge_items.append(f"<span class='chip' style='background:{et2color[k]}'></span> {title_txt}")
+    edge_legend_html = "<div class='legend'><b>Edges</b>: " + (" ".join(legend_edge_items) if legend_edge_items else "(no edge types)") + "</div>"
+
+    legend_html = node_legend_html + edge_legend_html
+
+    # --- 7) 左ペイン：コードHTML ---
     code_html = _build_code_html(code, node_lines, node2color, title="Function Source")
 
-    # --- 7) 合体HTML ---
+    # --- 8) 親ページ（HTML本体 + 連動スクリプト） ---
     css = """
     body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin:0; }
     .wrap { display:flex; gap:10px; padding:10px; }
@@ -217,7 +250,62 @@ def render_code_and_graph_html(
     h3 { margin: 6px 0 10px; }
     .legend { margin-bottom: 6px; font-size: 12px; }
     .chip { display:inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }
+    tr.code-row.hl > td.code { outline: 2px solid #ff9800; background: #fff3e0 !important; }
     """
+    node_lines_json = json.dumps({int(k): v for k, v in node_lines.items()}, ensure_ascii=False)
+    interop_js = f"""
+    <script>
+    (function() {{
+      const iframe = document.getElementById('graph_iframe');
+      const node2lines = {node_lines_json};
+
+      function setCodeHighlight(nodeIds) {{
+        document.querySelectorAll('tr.code-row.hl').forEach(tr => tr.classList.remove('hl'));
+        const lines = new Set();
+        (nodeIds || []).forEach(id => (node2lines[id] || []).forEach(li => lines.add(li)));
+        lines.forEach(li => {{
+          const tr = document.getElementById('L' + li);
+          if (tr) tr.classList.add('hl');
+        }});
+        // 一番小さい行へスクロール
+        if (lines.size > 0) {{
+          const minLine = Math.min.apply(null, Array.from(lines));
+          const tr = document.getElementById('L' + minLine);
+          if (tr) tr.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+        }}
+      }}
+
+      // iframe -> 親：ノード選択通知
+      window.addEventListener('message', (event) => {{
+        if (!event.data || !event.data.type) return;
+        if (event.data.type === 'highlight_lines') {{
+          setCodeHighlight(event.data.ids || []);
+        }}
+      }});
+
+      // 親 -> iframe：行ホバーでノード選択
+      function postToIframe(ids) {{
+        if (!iframe || !iframe.contentWindow) return;
+        iframe.contentWindow.postMessage({{ type: 'highlight_nodes', ids: ids || [] }}, '*');
+      }}
+
+      // 行ホバーで連動
+      document.querySelectorAll('tr.code-row').forEach(tr => {{
+        tr.addEventListener('mouseenter', () => {{
+          const s = tr.getAttribute('data-nodes') || '';
+          const ids = s.split(',').filter(Boolean).map(x => parseInt(x));
+          postToIframe(ids);
+          setCodeHighlight(ids);
+        }});
+        tr.addEventListener('mouseleave', () => {{
+          postToIframe([]);
+          setCodeHighlight([]);
+        }});
+      }});
+    }})();
+    </script>
+    """
+
     html_all = f"""<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>{_html.escape(title or "Graph & Code")}</title>
@@ -227,8 +315,60 @@ def render_code_and_graph_html(
     {code_html}
     {_build_graph_html(graph_div, legend_html, title="Graph")}
   </div>
+  {interop_js if pyvis_ok else ""}
 </body></html>
 """
     Path(out_html).parent.mkdir(parents=True, exist_ok=True)
     Path(out_html).write_text(html_all, encoding="utf-8")
     return out_html
+
+
+
+
+def _inject_pyvis_bridge(embed_path: Path):
+    """
+    PyVis が生成した HTML の末尾に、親<->iframe 連携のJSを差し込む。
+    - 親から {type:'highlight_nodes', ids:[...]} を受けると、該当ノードを選択＆フォーカス
+    - ノード選択/解除時に {type:'highlight_lines', ids:[...]} を親へ postMessage
+    """
+    txt = embed_path.read_text(encoding="utf-8")
+
+    # PyVisは vis.Network を 'network' という変数名で作るのが標準。
+    # 念のため存在チェックの try を入れて安全に動かす。
+    bridge = r"""
+<script>
+(function(){
+  function safe(fn){ try{ fn(); }catch(e){} }
+  window.addEventListener('message', function(event){
+    if (!event.data || event.data.type !== 'highlight_nodes') return;
+    safe(function(){
+      if (typeof network === 'undefined') return;
+      const ids = event.data.ids || [];
+      network.unselectAll();
+      if (ids.length) {
+        network.selectNodes(ids);
+        network.fit({nodes: ids, animation: true});
+      }
+    });
+  });
+
+  // ノード選択 → 親に該当ノードIDを投げる
+  safe(function(){
+    if (typeof network === 'undefined') return;
+    network.on("selectNode", function(params){
+      const ids = (params && params.nodes) ? params.nodes : [];
+      parent.postMessage({type: 'highlight_lines', ids: ids}, "*");
+    });
+    network.on("deselectNode", function(){
+      parent.postMessage({type: 'highlight_lines', ids: []}, "*");
+    });
+  });
+})();
+</script>
+"""
+    # </body> の直前に差し込む
+    if "</body>" in txt:
+        txt = txt.replace("</body>", bridge + "\n</body>")
+    else:
+        txt = txt + bridge
+    embed_path.write_text(txt, encoding="utf-8")
