@@ -245,11 +245,88 @@ def nodes_to_input(nodes, target, nodes_dim, *, mode: str = "codebert"):
         edge_index, _ = add_self_loops(edge_index, num_nodes=n_real)
         edge_type = torch.zeros(edge_index.size(1), dtype=torch.long)
 
+    node_list = sorted(list(nodes.values()), key=lambda z: z.order)
+
+    def _i(x):  # int or -1
+        try:
+            v = int(x)
+            return v if v > 0 else -1
+        except Exception:
+            return -1
+
+    start_lines, end_lines, start_cols, end_cols = [], [], [], []
+    for nd in node_list:
+        sline = _i(getattr(nd, "line_number", None))
+        scol  = _i(getattr(nd, "column_number", None))
+
+        # END_LINE が無いので CODE の改行数から簡易推定（最低でも start と同じ）
+        code_str = nd.get_code() if hasattr(nd, "get_code") else ""
+        if sline > 0 and isinstance(code_str, str):
+            e_line = sline + code_str.count("\n")
+        else:
+            e_line = sline
+
+        # end_column は持っていないので同値に（必要なら後で改善）
+        ecol = scol
+
+        start_lines.append(sline)
+        end_lines.append(e_line if e_line > 0 else sline)
+        start_cols.append(scol)
+        end_cols.append(ecol)
+
+    line_t     = torch.tensor(start_lines, dtype=torch.long)
+    end_line_t = torch.tensor(end_lines,  dtype=torch.long)
+    col_t      = torch.tensor(start_cols, dtype=torch.long)
+    end_col_t  = torch.tensor(end_cols,   dtype=torch.long)
+
+    # === ここまで追加 ===
+
     data = Data(
         x=x,
         edge_index=edge_index,
         edge_type=edge_type,
         y=torch.tensor([float(target)], dtype=torch.float32),
     )
-    data.num_nodes = n_real  # 実ノード数を明示
+    data = coalesce_by_triplet_(data)
+    data.num_nodes = n_real
+
+    # === ここから追加：属性として積む ===
+    data.line = line_t
+    data.end_line = end_line_t
+    data.column = col_t
+    data.end_column = end_col_t
+    # === ここまで追加 ===
+
     return data
+
+
+
+
+@torch.no_grad()
+def coalesce_by_triplet_(d: Data) -> Data:
+    """
+    (src, dst, edge_type) が完全一致のエッジ重複を除去（in-place）。
+    edge_attr 等があれば同様に並び替えてください。
+    """
+    ei = d.edge_index
+    assert ei is not None and torch.is_tensor(ei) and ei.dim() == 2 and ei.size(0) == 2
+
+    # edge_type が無ければ (src,dst) で統合
+    if not (hasattr(d, "edge_type") and torch.is_tensor(d.edge_type) and d.edge_type.numel() == ei.size(1)):
+        pairs = torch.stack([ei[0], ei[1]], dim=1)
+        uniq, idx = torch.unique(pairs, dim=0, return_inverse=False, return_counts=False, return_indices=True)
+        d.edge_index = uniq.t().contiguous()
+        # もし edge_type が None でなく長さ不一致なら、合わせてインデックスで引き直す
+        return d
+
+    et = d.edge_type
+    trip = torch.stack([ei[0], ei[1], et], dim=1)              # (E, 3)
+    uniq, inv = torch.unique(trip, dim=0, return_inverse=True) # uniq: (E',3)
+
+    # 一意な行だけ残す
+    keep = torch.unique(inv, sorted=True)
+    uniq_trip = uniq.index_select(0, torch.arange(uniq.size(0), device=uniq.device))  # not strictly needed
+    d.edge_index = uniq[:, :2].t().contiguous()
+    d.edge_type  = uniq[:, 2].contiguous()
+
+    return d

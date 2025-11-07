@@ -111,7 +111,7 @@ def render_code_and_graph_html(
     # --- 2) node_lines 推定 ---
     N = int(getattr(data, "num_nodes", 0) or 0)
     if node_lines is None:
-        node_lines = {}
+        node_lines = _infer_node_lines(data, code)
         cand = {}
         for name in ("node_line", "line", "lineno"):
             if hasattr(data, name):
@@ -174,8 +174,28 @@ def render_code_and_graph_html(
 
         # ノード
         for i in G.nodes:
-            color = node2color.get(int(i), "#89a")
-            net.add_node(int(i), label=str(i), color=color, title=f"node {i}")
+            nid = int(i)
+            color = node2color.get(nid, "#89a")
+
+            # ---- ノードのコード断片を作成 ----
+            lines = node_lines.get(nid, [])
+            if lines:
+                code_lines = code.splitlines()
+                chosen = []
+                for li in lines:
+                    if 1 <= li <= len(code_lines):
+                        chosen.append(f"{li:3d}: {code_lines[li-1]}")
+                snippet = html.escape("\n".join(chosen)) if chosen else "no lines"
+            else:
+                snippet = "no lines"
+
+            net.add_node(
+                nid,
+                label=str(nid),
+                color=color,
+                title=f"<pre style='font-size:12px'>{snippet}</pre>"
+            )
+
 
         # エッジ（タイプ別に色分け）
         if G.number_of_edges() > 0:
@@ -372,3 +392,167 @@ def _inject_pyvis_bridge(embed_path: Path):
     else:
         txt = txt + bridge
     embed_path.write_text(txt, encoding="utf-8")
+
+
+
+
+
+def _safe_to_list(v, N=None):
+    # torch/numpy/list を素直な list[int or None] に
+    try:
+        import torch, numpy as np
+    except Exception:
+        torch = np = None
+    try:
+        if torch is not None and isinstance(v, torch.Tensor):
+            v = v.detach().cpu().tolist()
+        elif np is not None and isinstance(v, np.ndarray):
+            v = v.tolist()
+    except Exception:
+        pass
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    return None
+
+def _is_lenN_numeric(lst, N):
+    if not isinstance(lst, list) or (N is not None and len(lst) != N):
+        return False
+    ok = 0
+    for x in lst:
+        try:
+            float(x)  # NaNは別で扱う
+            ok += 1
+        except Exception:
+            return False
+    return ok > 0
+
+def _fix_zero_based(lst, max_line):
+    # 0始まり対策: 最小が0で、最大がコード行数以内っぽければ+1
+    if not lst:
+        return lst
+    xs = [int(x) if x is not None else None for x in lst]
+    xs_nonneg = [x for x in xs if x is not None and x >= 0]
+    if not xs_nonneg:
+        return xs
+    mn, mx = min(xs_nonneg), max(xs_nonneg)
+    if mn == 0 and 0 <= mx <= max_line:
+        return [None if x is None else (x+1 if x >= 0 else None) for x in xs]
+    return xs
+
+def _choose_pair(cands, code_line_len):
+    """
+    cands: {name -> list}
+    優先順位:
+      1) (start系, end系) のペア
+      2) (line系) 単独（start=end=line）
+    """
+    names = list(cands.keys())
+    lname = [n.lower() for n in names]
+
+    start_keys = [n for n in names if any(k in n.lower() for k in ["node_start","start_line","startline","start","linestart","line_start","begin","begin_line"])]
+    end_keys   = [n for n in names if any(k in n.lower() for k in ["node_end","end_line","endline","end","lineend","line_end","stop","stop_line"])]
+    line_keys  = [n for n in names if ("line" in n.lower() or "lineno" in n.lower() or "linenumber" in n.lower()) and n not in start_keys+end_keys]
+
+    # まずペアを探す
+    for sk in start_keys:
+        for ek in end_keys:
+            S, E = cands[sk], cands[ek]
+            if len(S) == len(E):
+                return sk, ek
+
+    # 単独 line
+    for lk in line_keys:
+        return lk, None
+
+    # 最後の手段：start系 or end系 どちらか単独
+    if start_keys:
+        return start_keys[0], None
+    if end_keys:
+        return end_keys[0], None
+
+    return None, None
+
+def _infer_node_lines(data, code: str):
+    # ノード数の決定
+    import math
+    N = None
+    # xの行数優先
+    if hasattr(data, "x") and getattr(data, "x") is not None:
+        try:
+            N = int(getattr(data, "x").size(0))
+        except Exception:
+            pass
+    if N is None:
+        try:
+            N = int(getattr(data, "num_nodes"))
+        except Exception:
+            pass
+    if N is None and hasattr(data, "edge_index"):
+        try:
+            import torch
+            N = int(getattr(data, "edge_index").max().item() + 1)
+        except Exception:
+            pass
+    if N is None:
+        return {}  # 推定不能
+
+    # data の属性を総当りで候補収集
+    code_lines = code.splitlines()
+    max_line = len(code_lines)
+    cands = {}
+    for name in dir(data):
+        if name.startswith("_"):  # 内部属性は除外
+            continue
+        # 候補名（line系 / start系 / end系）にだけ反応
+        key = name.lower()
+        if not any(k in key for k in ["line","lineno","linenumber","start","end","begin","stop"]):
+            continue
+        try:
+            v = getattr(data, name)
+        except Exception:
+            continue
+        lst = _safe_to_list(v, N=N)
+        if not _is_lenN_numeric(lst, N):
+            continue
+        # NaN / None / 0 / -1 を欠損として扱う
+        clean = []
+        for x in lst:
+            try:
+                xf = float(x)
+            except Exception:
+                clean.append(None); continue
+            if math.isnan(xf) or int(xf) in (0, -1):
+                clean.append(None)
+            else:
+                clean.append(int(xf))
+        # 0始まり補正
+        clean = _fix_zero_based(clean, max_line)
+        cands[name] = clean
+
+    # 選択
+    sk, ek = _choose_pair(cands, max_line)
+    node_lines = {}
+    if sk is not None and ek is not None:
+        S, E = cands[sk], cands[ek]
+        for nid in range(N):
+            s, e = S[nid], E[nid]
+            if s is None:
+                continue
+            if e is None or e < s:
+                e = s
+            if 1 <= s <= max_line:
+                e = min(max_line, e)
+                node_lines[nid] = list(range(s, e+1))
+    elif sk is not None:
+        V = cands[sk]
+        for nid in range(N):
+            s = V[nid]
+            if s is None:
+                continue
+            if 1 <= s <= max_line:
+                node_lines[nid] = [s]
+    else:
+        # 何も見つからない
+        node_lines = {}
+
+    return node_lines

@@ -6,12 +6,20 @@ import gc
 import pandas as pd
 import utils.process as process
 import utils.functions.cpg_dir as cpg
-
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import matplotlib.pyplot as plt
+import torch
 from utils.functions.cpg import parse_to_functions
 from utils.process.embeddings import nodes_to_input
 from utils.data.datamanager import loads, train_val_test_split
 from utils.validate.save_utils import save_split_from_loaders, cache_loader_items, save_loader_sample_json
 from utils.validate.analyze_utils import peek_loader, summarize_generic_loader, summarize_graph_loader, describe_pyg_graph
+from argparse import ArgumentParser
+import argparse
+from models.LMGNN import BertGGCN
+from test import test
+
 
 
 PATHS = configs.Paths()
@@ -100,3 +108,130 @@ def Embed_generator():
         data.write(out_df, PATHS.input, f"{file_name}_{FILES.input}")
 
 
+def train(model, device, train_loader, optimizer, epoch):
+    """
+    Trains the model using the provided data.
+
+    :param model: The model to be trained.
+    :param device: The device to perform training on (e.g., 'cpu' or 'cuda').
+    :param train_loader: The data loader containing the training data.
+    :param optimizer: The optimizer used for training.
+    :param epoch: The current epoch number.
+    :return: None
+    """
+
+    model.train()
+    best_acc = 0.0
+    for batch_idx, batch in enumerate(train_loader):
+        batch.to(device)
+
+        y_pred = model(batch)
+        model.zero_grad()
+        # print("y_pred data type:", y_pred.dtype)
+        # print("batch.y.squeeze() data type:", batch.y.squeeze().dtype)
+        batch.y = batch.y.squeeze().long()
+        loss = F.cross_entropy(y_pred, batch.y)
+        loss.backward()
+        optimizer.step()
+        if (batch_idx + 1) % 100 == 0:
+            print('Train Epoch: {} [{}/{} ({:.2f}%)]/t Loss: {:.6f}'.format(epoch, (batch_idx + 1) * len(batch),
+                                                                            len(train_loader.dataset),
+                                                                            100. * batch_idx / len(train_loader),
+                                                                            loss.item()))
+            
+
+def validate(model, device, test_loader):
+    """
+    Validates the model using the provided test data.
+
+    :param model: The model to be validated.
+    :param device: The device to perform validation on (e.g., 'cpu' or 'cuda').
+    :param test_loader: The data loader containing the test data.
+    :return: Tuple containing accuracy, precision, recall, and F1 score.
+    """
+    model.eval()
+    test_loss = 0.0
+    y_true = []
+    y_pred = []
+
+    for batch_idx, batch in enumerate(test_loader):
+        batch.to(device)
+        with torch.no_grad():
+            y_ = model(batch)
+
+        batch.y = batch.y.squeeze().long()
+        test_loss += F.cross_entropy(y_, batch.y).item()
+        pred = y_.max(-1, keepdim=True)[1]
+
+        y_true.extend(batch.y.cpu().numpy())
+        y_pred.extend(pred.cpu().numpy())
+
+    test_loss /= len(test_loader)
+
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(8, 6))
+    # sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=['benign', 'malware'], yticklabels=['benign', 'malware'])
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.savefig('confusion_matrix.png')
+
+    print('Test set: Average loss: {:.4f}, Accuracy: {:.2f}%, Precision: {:.2f}%, Recall: {:.2f}%, F1: {:.2f}%'.format(
+        test_loss, accuracy * 100, precision * 100, recall * 100, f1 * 100))
+
+    return accuracy, precision, recall, f1
+
+
+if __name__ == '__main__':
+    parser: ArgumentParser = argparse.ArgumentParser()
+    # parser.add_argument('-p', '--prepare', help='Prepare task', required=False)
+    parser.add_argument('-cpg', '--cpg', action='store_true', help='Specify to perform CPG generation task')
+    parser.add_argument('-embed', '--embed', action='store_true', help='Specify to perform Embedding generation task')
+    parser.add_argument('-mode', '--mode', default="train", help='Specify the mode (e.g., train, test)')
+    parser.add_argument('-path', '--path', default=None, help='Specify the path for the model')
+
+    args = parser.parse_args()
+
+    if args.cpg:
+        CPG_generator()
+    if args.embed:
+        Embed_generator()
+
+    context = configs.Process()
+    input_dataset = loads(PATHS.input)
+    # split the dataset and pass to DataLoader with batch size
+    train_loader, val_loader, test_loader = list(
+        map(lambda x: x.get_loader(context.batch_size, shuffle=context.shuffle),
+            train_val_test_split(input_dataset, shuffle=context.shuffle)))
+
+    Bertggnn = configs.BertGGNN()
+    gated_graph_conv_args = Bertggnn.model["gated_graph_conv_args"]
+    conv_args = Bertggnn.model["conv_args"]
+    emb_size = Bertggnn.model["emb_size"]
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    print("Using device:", device)
+
+    if args.mode == "train":
+        model = BertGGCN(gated_graph_conv_args, conv_args, emb_size, device).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=Bertggnn.learning_rate, weight_decay=Bertggnn.weight_decay)
+
+        best_acc = 0.0
+        NUM_EPOCHS = context.epochs
+        PATH = args.path
+        for epoch in range(1, NUM_EPOCHS + 1):
+            train(model, device, train_loader, optimizer, epoch)
+            acc, precision, recall, f1 = validate(model, DEVICE, val_loader)
+            if best_acc < acc:
+                best_acc = acc
+                torch.save(model.state_dict(), PATH)
+            print("acc is: {:.4f}, best acc is {:.4f}n".format(acc, best_acc))
+
+    model_test = BertGGCN(gated_graph_conv_args, conv_args, emb_size, device).to(device)
+    model_test.load_state_dict(torch.load(args.path))
+    accuracy, precision, recall, f1 = test(model_test, DEVICE, test_loader)

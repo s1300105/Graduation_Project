@@ -114,3 +114,24 @@ class Process(Config):
     @property
     def shuffle(self):
         return self.get_property('shuffle')
+
+
+class BertGGNN(Config):
+    def __init__(self):
+        super().__init__('bertggnn')
+
+    @property
+    def learning_rate(self):
+        return self.get_property('learning_rate')
+
+    @property
+    def weight_decay(self):
+        return self.get_property('weight_decay')
+
+    @property
+    def loss_lambda(self):
+        return self.get_property('loss_lambda')
+
+    @property
+    def model(self):
+        return self.get_property('model')
