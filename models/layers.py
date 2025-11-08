@@ -1,11 +1,10 @@
-import torch as th
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn.conv import GatedGraphConv
-from transformers import AutoModel, AutoTokenizer
-from transformers import RobertaTokenizer, RobertaConfig, RobertaModel
 
-th.manual_seed(2020)
+from torch_geometric.nn.conv import GatedGraphConv
+
+torch.manual_seed(2020)
 
 
 def get_conv_mp_out_size(in_size, last_layer, mps):
@@ -19,29 +18,17 @@ def get_conv_mp_out_size(in_size, last_layer, mps):
     return int(size * last_layer["out_channels"])
 
 
-def init_weights(m):
-    if type(m) == nn.Linear or type(m) == nn.Conv1d:
-        th.nn.init.xavier_uniform_(m.weight)
-
 def encode_input(text, tokenizer):
     max_length = 512
     input = tokenizer(text, max_length=max_length, truncation=True, padding='max_length', return_tensors='pt')
 #     print(input.keys())
     return input.input_ids, input.attention_mask
 
-class CodeBertClassifier(th.nn.Module):
-    def __init__(self, pretrained_model='roberta_base', nb_class=2):
-        super(CodeBertClassifier, self).__init__()
-        self.nb_class = nb_class
-        self.tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
-        self.bert_model = RobertaModel.from_pretrained("microsoft/codebert-base")
-        self.feat_dim = list(self.bert_model.modules())[-2].out_features
-        self.classifier = th.nn.Linear(self.feat_dim, self.nb_class)
 
-    def forward(self, input_ids, attention_mask):
-        cls_feats = self.bert_model(input_ids, attention_mask)[0][:, 0]
-        cls_logit = self.classifier(cls_feats)
-        return cls_logit
+def init_weights(m):
+    if type(m) == nn.Linear or type(m) == nn.Conv1d:
+        torch.nn.init.xavier_uniform_(m.weight)
+
 
 class Conv(nn.Module):
 
@@ -50,22 +37,32 @@ class Conv(nn.Module):
         self.conv1d_1_args = conv1d_1
         self.conv1d_1 = nn.Conv1d(**conv1d_1)
         self.conv1d_2 = nn.Conv1d(**conv1d_2)
-
-        fc1_size = get_conv_mp_out_size(fc_1_size, conv1d_2, [maxpool1d_1, maxpool1d_2])
-        fc2_size = get_conv_mp_out_size(fc_2_size, conv1d_2, [maxpool1d_1, maxpool1d_2])
-
-        # Dense layers
-        self.fc1 = nn.Linear(fc1_size, 1)
-        self.fc2 = nn.Linear(fc2_size, 1)
-
-        # Dropout
-        self.drop = nn.Dropout(p=0.2)
-
         self.mp_1 = nn.MaxPool1d(**maxpool1d_1)
         self.mp_2 = nn.MaxPool1d(**maxpool1d_2)
+        self.drop = nn.Dropout(p=0.2)
+
+        # --- ここから: 実ラン形状でFC in_featuresを推定 ---
+        with torch.no_grad():
+            C = self.conv1d_1_args["in_channels"]
+            # Z 経路（hidden と x を結合した長さ）
+            dummy_Z = torch.zeros(1, C, int(fc_1_size))
+            Z = self.mp_1(F.relu(self.conv1d_1(dummy_Z)))
+            Z = self.mp_2(self.conv1d_2(Z))
+            Z_flatten_size = int(Z.shape[1] * Z.shape[-1])
+
+            # Y 経路（hidden のみ）
+            dummy_Y = torch.zeros(1, C, int(fc_2_size))
+            Y = self.mp_1(F.relu(self.conv1d_1(dummy_Y)))
+            Y = self.mp_2(self.conv1d_2(Y))
+            Y_flatten_size = int(Y.shape[1] * Y.shape[-1])
+
+        # Dense layers（in_features を実計測で設定）
+        self.fc1 = nn.Linear(Z_flatten_size, 1)
+        self.fc2 = nn.Linear(Y_flatten_size, 1)
+
 
     def forward(self, hidden, x):
-        concat = th.cat([hidden, x], 1)
+        concat = torch.cat([hidden, x], 1)
         concat_size = hidden.shape[1] + x.shape[1]
         concat = concat.view(-1, self.conv1d_1_args["in_channels"], concat_size)
 
@@ -84,10 +81,10 @@ class Conv(nn.Module):
         Y = Y.view(-1, Y_flatten_size)
         res = self.fc1(Z) * self.fc2(Y)
         res = self.drop(res)
-
-        res = F.softmax(res, dim=1)
-
-        return res
+        # res = res.mean(1)
+        # print(res, mean)
+        sig = torch.sigmoid(torch.flatten(res))
+        return sig
 
 
 class Net(nn.Module):
@@ -108,7 +105,7 @@ class Net(nn.Module):
         return x
 
     def save(self, path):
-        th.save(self.state_dict(), path)
+        torch.save(self.state_dict(), path)
 
     def load(self, path):
-        self.load_state_dict(th.load(path))
+        self.load_state_dict(torch.load(path))
