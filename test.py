@@ -51,6 +51,7 @@ def test(model, device, test_loader):
     plt.ylabel('True')
     plt.title('Confusion Matrix')
     plt.savefig('confusion_matrix.png')
+    plt.close()
 
     fpr, tpr, _ = roc_curve(y_true, y_probs)
     roc_auc = auc(fpr, tpr)
@@ -65,6 +66,7 @@ def test(model, device, test_loader):
     plt.title('Receiver Operating Characteristic (ROC) Curve')
     plt.legend(loc='lower right')
     plt.savefig('roc_curve.png')
+    plt.close()
 
     results_array = np.column_stack((y_true, y_pred, y_probs))
     header_text = "True label, Predicted label, Predicted Probability"

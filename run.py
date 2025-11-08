@@ -1,47 +1,51 @@
+import argparse
+from argparse import ArgumentParser
+from collections import Counter
+from pathlib import Path
+import shutil
+import gc
+import os
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import WeightedRandomSampler
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+
+# ★ 追加：PyG の DataLoader を使う
+from torch_geometric.loader import DataLoader as GeoDataLoader
+
 import configs
 import utils.data as data
 import utils.process as process
-import shutil
-import gc
-import pandas as pd
-import utils.process as process
-import utils.functions.cpg_dir as cpg
-import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import matplotlib.pyplot as plt
-import torch
+import utils.functions.cpg_dir as cpg  # 参照されているので残す
 from utils.functions.cpg import parse_to_functions
 from utils.process.embeddings import nodes_to_input
 from utils.data.datamanager import loads, train_val_test_split
 from utils.validate.save_utils import save_split_from_loaders, cache_loader_items, save_loader_sample_json
 from utils.validate.analyze_utils import peek_loader, summarize_generic_loader, summarize_graph_loader, describe_pyg_graph
-from argparse import ArgumentParser
-import argparse
+
 from models.LMGNN import BertGGCN
 from test import test
 
 
-
 PATHS = configs.Paths()
 FILES = configs.Files()
-DEVICE = FILES.get_device()
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
-def select(dataset):
-    result = dataset.loc[dataset['project'] == "qemu"] #select data from only qemu project
+def select(dataset: pd.DataFrame) -> pd.DataFrame:
+    result = dataset.loc[dataset['project'] == "qemu"]
     len_filter = result.func.str.len() < 1200
     result = result.loc[len_filter]
-    result = result.head(1000) # For debug, only 200 samples is extracted.
-    
+    result = result.head(1000)
     return result
 
-def CPG_generator():
-    """
-    Generates Code Property Graph (CPG) datasets from raw data.
-    """
 
+def CPG_generator():
     context = configs.Create()
-    raw = data.read(PATHS.raw, FILES.raw) #DataFrame
+    raw = data.read(PATHS.raw, FILES.raw)  # DataFrame
 
     filtered = data.apply_filter(raw, select)
     filtered = data.clean(filtered)
@@ -50,7 +54,6 @@ def CPG_generator():
     slices = [(s, slice.apply(lambda x: x)) for s, slice in slices]
 
     cpg_files = []
-    #Create CPG binary files
     for s, slice in slices:
         data.to_files(slice, PATHS.joern)
         cpg_file = process.joern_parse(context.joern_cli_dir, PATHS.joern, PATHS.cpg, f"{s}_{FILES.cpg}")
@@ -58,7 +61,6 @@ def CPG_generator():
         print(f"Dataset {s} to cpg.")
         shutil.rmtree(PATHS.joern)
 
-    #Create CPG with graphs json files
     json_files = process.joern_create(context.joern_cli_dir, PATHS.cpg, PATHS.cpg, cpg_files)
     for (s, slice), json_file in zip(slices, json_files):
         graphs = process.json_process(PATHS.cpg, json_file)
@@ -66,21 +68,16 @@ def CPG_generator():
             print(f"Dataset chunk {s} not processed.")
             continue
 
-        # graphs: List[Tuple[int, dict]] -> DataFrame へ
         df_graphs = pd.DataFrame(graphs, columns=["Index", "cpg"])
         df_graphs["Index"] = df_graphs["Index"].astype(int)
 
-        # ここで初めて create_with_index に渡す
         dataset = data.create_with_index(df_graphs, ["Index", "cpg"])
-
         dataset = data.inner_join_by_index(slice, dataset)
-        print(f"Writting cpg dataset chunk {s}.")
+
+        print(f"Writing cpg dataset chunk {s}.")
         data.write(dataset, PATHS.cpg, f"{s}_{FILES.cpg}.pkl")
         del dataset
         gc.collect()
-
-
-
 
 
 def Embed_generator():
@@ -101,101 +98,91 @@ def Embed_generator():
                 g = process.nodes_to_input(nodes, row.target, context.nodes_dim, mode="codebert")
                 rows.append({"input": g, "target": row.target, "func": row.func})
 
-        out_df = pd.DataFrame(rows, columns=["input","target","func"])
+        out_df = pd.DataFrame(rows, columns=["input", "target", "func"])
         print(f"[INFO] saving INPUT rows={len(out_df)}  file={file_name}_{FILES.input}")
         if len(out_df) == 0:
             print("[WARN] No functions parsed from this CPG chunk. Check parser/filter settings.")
         data.write(out_df, PATHS.input, f"{file_name}_{FILES.input}")
 
 
-def train(model, device, train_loader, optimizer, epoch):
-    """
-    Trains the model using the provided data.
-
-    :param model: The model to be trained.
-    :param device: The device to perform training on (e.g., 'cpu' or 'cuda').
-    :param train_loader: The data loader containing the training data.
-    :param optimizer: The optimizer used for training.
-    :param epoch: The current epoch number.
-    :return: None
-    """
-
+def train(model, train_loader, optimizer, epoch, criterion):
     model.train()
-    best_acc = 0.0
     for batch_idx, batch in enumerate(train_loader):
         batch.to(device)
-
         y_pred = model(batch)
         model.zero_grad()
-        # print("y_pred data type:", y_pred.dtype)
-        # print("batch.y.squeeze() data type:", batch.y.squeeze().dtype)
         batch.y = batch.y.squeeze().long()
-        loss = F.cross_entropy(y_pred, batch.y)
+        loss = criterion(y_pred, batch.y)
         loss.backward()
         optimizer.step()
+
         if (batch_idx + 1) % 100 == 0:
-            print('Train Epoch: {} [{}/{} ({:.2f}%)]/t Loss: {:.6f}'.format(epoch, (batch_idx + 1) * len(batch),
-                                                                            len(train_loader.dataset),
-                                                                            100. * batch_idx / len(train_loader),
-                                                                            loss.item()))
-            
+            print('Train Epoch: {} [{}/{} ({:.2f}%)]/t Loss: {:.6f}'.format(
+                epoch,
+                (batch_idx + 1) * len(batch),
+                len(train_loader.dataset) if hasattr(train_loader, "dataset") else -1,
+                100. * batch_idx / len(train_loader),
+                loss.item()
+            ))
 
-def validate(model, device, test_loader):
-    """
-    Validates the model using the provided test data.
 
-    :param model: The model to be validated.
-    :param device: The device to perform validation on (e.g., 'cpu' or 'cuda').
-    :param test_loader: The data loader containing the test data.
-    :return: Tuple containing accuracy, precision, recall, and F1 score.
-    """
+def validate(model, val_loader):
     model.eval()
     test_loss = 0.0
-    y_true = []
-    y_pred = []
+    y_true, y_pred_labels = [], []
 
-    for batch_idx, batch in enumerate(test_loader):
-        batch.to(device)
-        with torch.no_grad():
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            batch.to(device)
             y_ = model(batch)
+            batch.y = batch.y.squeeze().long()
+            test_loss += F.cross_entropy(y_, batch.y).item()
+            pred = y_.max(-1, keepdim=True)[1]
+            y_true.extend(batch.y.cpu().numpy())
+            y_pred_labels.extend(pred.cpu().numpy())
 
-        batch.y = batch.y.squeeze().long()
-        test_loss += F.cross_entropy(y_, batch.y).item()
-        pred = y_.max(-1, keepdim=True)[1]
+    test_loss /= len(val_loader)
 
-        y_true.extend(batch.y.cpu().numpy())
-        y_pred.extend(pred.cpu().numpy())
+    accuracy = accuracy_score(y_true, y_pred_labels)
+    precision = precision_score(y_true, y_pred_labels, zero_division=0)
+    recall = recall_score(y_true, y_pred_labels, zero_division=0)
+    f1 = f1_score(y_true, y_pred_labels, zero_division=0)
 
-    test_loss /= len(test_loader)
-
-    accuracy = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
-
-    cm = confusion_matrix(y_true, y_pred)
-
+    cm = confusion_matrix(y_true, y_pred_labels)
     plt.figure(figsize=(8, 6))
-    # sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=['benign', 'malware'], yticklabels=['benign', 'malware'])
     plt.xlabel('Predicted')
     plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    plt.savefig('confusion_matrix.png')
+    plt.title('Confusion Matrix (Val)')
+    plt.savefig('confusion_matrix_val.png')
+    plt.close()
 
     print('Test set: Average loss: {:.4f}, Accuracy: {:.2f}%, Precision: {:.2f}%, Recall: {:.2f}%, F1: {:.2f}%'.format(
-        test_loss, accuracy * 100, precision * 100, recall * 100, f1 * 100))
-
+        test_loss, accuracy * 100, precision * 100, recall * 100, f1 * 100
+    ))
     return accuracy, precision, recall, f1
+
+
+def _resolve_save_path(user_path: str | None, default_dir: str = "./saved_models", filename: str = "bertggcn.pth") -> Path:
+    if not user_path or user_path.strip() == "":
+        save_dir = Path(default_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        return save_dir / filename
+
+    p = Path(user_path)
+    if p.suffix == "":
+        p.mkdir(parents=True, exist_ok=True)
+        return p / filename
+    else:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
 
 
 if __name__ == '__main__':
     parser: ArgumentParser = argparse.ArgumentParser()
-    # parser.add_argument('-p', '--prepare', help='Prepare task', required=False)
-    parser.add_argument('-cpg', '--cpg', action='store_true', help='Specify to perform CPG generation task')
-    parser.add_argument('-embed', '--embed', action='store_true', help='Specify to perform Embedding generation task')
-    parser.add_argument('-mode', '--mode', default="train", help='Specify the mode (e.g., train, test)')
-    parser.add_argument('-path', '--path', default=None, help='Specify the path for the model')
-
+    parser.add_argument('-cpg', '--cpg', action='store_true', help='CPG generation task')
+    parser.add_argument('-embed', '--embed', action='store_true', help='Embedding generation task')
+    parser.add_argument('-mode', '--mode', default="train", help='train / test')
+    parser.add_argument('-path', '--path', default=None, help='model path or dir')
     args = parser.parse_args()
 
     if args.cpg:
@@ -203,19 +190,60 @@ if __name__ == '__main__':
     if args.embed:
         Embed_generator()
 
+    # === データ読み込み・分割 ===
     context = configs.Process()
     input_dataset = loads(PATHS.input)
-    # split the dataset and pass to DataLoader with batch size
-    train_loader, val_loader, test_loader = list(
-        map(lambda x: x.get_loader(context.batch_size, shuffle=context.shuffle),
-            train_val_test_split(input_dataset, shuffle=context.shuffle)))
+    train_ds, val_ds, test_ds = train_val_test_split(input_dataset, shuffle=context.shuffle)
 
+    # === クラス不均衡対策 ===
+    cnt = Counter(int(sample.y) for sample in train_ds)
+    num0, num1 = cnt.get(0, 0), cnt.get(1, 0)
+    N = max(1, num0 + num1)
+    w0 = N / (2 * max(1, num0))
+    w1 = N / (2 * max(1, num1))
+    print(f"[ClassCount] num0={num0}, num1={num1} -> w0={w0:.4f}, w1={w1:.4f}")
+
+    class_weights = torch.tensor([w0, w1], dtype=torch.float, device=device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+
+    sample_weights = [(w1 if int(sample.y) == 1 else w0) for sample in train_ds]
+    sampler = WeightedRandomSampler(weights=sample_weights,
+                                    num_samples=len(sample_weights),
+                                    replacement=True)
+
+    # === DataLoader 作成（PyGのDataLoaderを必ず使う） ===
+    def build_loader(ds, batch_size, use_sampler=False, sampler_obj=None, shuffle=False):
+        # ds.get_loader がある場合はそれを優先（互換のため）
+        if hasattr(ds, "get_loader"):
+            try:
+                return ds.get_loader(
+                    batch_size,
+                    shuffle=(False if use_sampler else shuffle),
+                    sampler=(sampler_obj if use_sampler else None)
+                )
+            except TypeError:
+                pass
+        # フォールバック：必ず GeoDataLoader を使う（PyG Data を正しくバッチ化）
+        return GeoDataLoader(
+            ds,
+            batch_size=batch_size,
+            sampler=(sampler_obj if use_sampler else None),
+            shuffle=(False if use_sampler else shuffle)
+        )
+
+    train_loader = build_loader(train_ds, context.batch_size, use_sampler=False, sampler_obj=None, shuffle=True)
+    val_loader   = build_loader(val_ds,   context.batch_size, use_sampler=False, sampler_obj=None, shuffle=False)
+    test_loader  = build_loader(test_ds,  context.batch_size, use_sampler=False, sampler_obj=None, shuffle=False)
+
+    print("Using device:", device)
+
+    # === モデル・最適化器 ===
     Bertggnn = configs.BertGGNN()
     gated_graph_conv_args = Bertggnn.model["gated_graph_conv_args"]
     conv_args = Bertggnn.model["conv_args"]
     emb_size = Bertggnn.model["emb_size"]
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    print("Using device:", device)
+
+    SAVE_PATH = _resolve_save_path(args.path)
 
     if args.mode == "train":
         model = BertGGCN(gated_graph_conv_args, conv_args, emb_size, device).to(device)
@@ -223,15 +251,15 @@ if __name__ == '__main__':
 
         best_acc = 0.0
         NUM_EPOCHS = context.epochs
-        PATH = args.path
         for epoch in range(1, NUM_EPOCHS + 1):
-            train(model, device, train_loader, optimizer, epoch)
-            acc, precision, recall, f1 = validate(model, DEVICE, val_loader)
+            train(model, train_loader, optimizer, epoch, criterion)
+            acc, precision, recall, f1 = validate(model, val_loader)
             if best_acc < acc:
                 best_acc = acc
-                torch.save(model.state_dict(), PATH)
-            print("acc is: {:.4f}, best acc is {:.4f}n".format(acc, best_acc))
+                torch.save(model.state_dict(), str(SAVE_PATH))
+            print("acc is: {:.4f}, best acc is {:.4f}".format(acc, best_acc))
 
+    # === ベストモデルで test ===
     model_test = BertGGCN(gated_graph_conv_args, conv_args, emb_size, device).to(device)
-    model_test.load_state_dict(torch.load(args.path))
-    accuracy, precision, recall, f1 = test(model_test, DEVICE, test_loader)
+    model_test.load_state_dict(torch.load(str(SAVE_PATH), map_location=device))
+    accuracy, precision, recall, f1 = test(model_test, device, test_loader)
