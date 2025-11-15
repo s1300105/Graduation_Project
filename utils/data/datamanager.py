@@ -47,8 +47,33 @@ def write(data_frame: pd.DataFrame, path, file_name):
 def apply_filter(data_frame: pd.DataFrame, filter_func):
     return filter_func(data_frame)
 
-def clean(data_frame: pd.DataFrame):
-    return data_frame.drop_duplicates(subset="func", keep=False)
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    生データ用の安全なクレンジング関数。
+    - 同じ行が完全に重複している場合だけ削除する。
+      （project, commit_id, target, func, idx が全部同じもの）
+    - 同じ func でも project / commit_id / target が違うものはそのまま残す。
+    """
+    df = df.copy()
+
+    before = len(df)
+
+    # ① func ごとにラベルが食い違っているものがないかだけチェック（削除はしない）
+    if "func" in df.columns and "target" in df.columns:
+        vc = df.groupby("func")["target"].nunique()
+        conflict_funcs = vc[vc > 1]
+        if len(conflict_funcs) > 0:
+            print(f"[clean/raw] WARNING: 同じ func で target が異なるものが {len(conflict_funcs)} 個あります。"
+                  " 生データでは何も削除しません。")
+
+    # ② 完全に同じ行（全カラム一致）のみ削除
+    df_clean = df.drop_duplicates(keep="first")
+
+    after = len(df_clean)
+    print(f"[clean/raw] {before} -> {after} rows "
+          f"(removed {before - after} exact duplicate rows)")
+
+    return df_clean
 
 def drop(data_frame: pd.DataFrame, keys):
     for key in keys:
@@ -63,7 +88,8 @@ def to_files(data_frame: pd.DataFrame, out_path):
 
     for idx, row in data_frame.iterrows():
         file_name = f"{idx}.c"
-        with open(out_path + file_name, 'w') as f:
+        fp = os.path.join(out_path, file_name)
+        with open(fp, 'w', encoding='utf-8') as f:
             f.write(row.func)
 
 def create_with_index(data_frame, columns):
@@ -102,11 +128,36 @@ def get_ratio(dataset, ratio):
     return dataset[:approx_size]
 
 def load(path, pickle_file, ratio=1):
-    dataset = pd.read_pickle(path + pickle_file)
+    """
+    Pickleファイルをgzip圧縮・非圧縮の両方に対応して安全に読み込む。
+    ratio < 1 の場合は一部だけサンプリングして返す。
+    """
+    full_path = Path(path) / pickle_file
+    if not full_path.exists():
+        raise FileNotFoundError(f"File not found: {full_path}")
+
+    # gzip判定: 先頭2バイトが 0x1f 0x8b
+    try:
+        with open(full_path, "rb") as fh:
+            head = fh.read(2)
+        if head == b"\x1f\x8b":
+            dataset = pd.read_pickle(full_path, compression="gzip")
+        else:
+            dataset = pd.read_pickle(full_path)
+    except Exception as e:
+        # どちらかで失敗した場合、フォールバックしてもう片方で試す
+        try:
+            dataset = pd.read_pickle(full_path, compression="gzip")
+        except Exception:
+            raise RuntimeError(f"Failed to load pickle file (gzip/non-gzip both failed): {full_path}\n{e}")
+
+    # データ情報を出力
     dataset.info(memory_usage='deep')
+
+    # ratio指定があれば部分サンプリング
     if ratio < 1:
         dataset = get_ratio(dataset, ratio)
-    
+
     return dataset
 
 def loads(data_sets_dir, ratio=1):
