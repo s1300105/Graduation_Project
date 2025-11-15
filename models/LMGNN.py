@@ -110,110 +110,117 @@ def sanitize_for_rgcn(d, *, trim_x: bool = True, do_coalesce: bool = True):
     return d
 
 
+from transformers import AutoTokenizer
+
+
 class BertRGCN(nn.Module):
     def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None):
         super().__init__()
         self.device = device
 
-        # ------------------------------------------------------------
-        # 1) R-GCN 用の設定
-        # ------------------------------------------------------------
         hidden_dim   = gated_graph_conv_args.get("out_channels", 200)
         num_rel      = gated_graph_conv_args.get("num_relations", 3)
         num_layers   = gated_graph_conv_args.get("num_layers", 6)
         self.hidden_dim = hidden_dim
         self.code_dim   = emb_size
 
-        # CodeBERT 埋め込み → R-GCN 入力次元に射影
+        # R-GCN 用
         self.input_proj = nn.Linear(emb_size, hidden_dim)
+        self.rgcn_layers = nn.ModuleList([
+            RGCNConv(hidden_dim, hidden_dim, num_rel)
+            for _ in range(num_layers)
+        ])
 
-        # R-GCN スタック
-        self.rgcn_layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.rgcn_layers.append(
-                RGCNConv(
-                    in_channels=hidden_dim,
-                    out_channels=hidden_dim,
-                    num_relations=num_rel,
-                )
-            )
+        # ★ 用途② CodeBERT（トークン列用）
+        self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+        self.func_encoder   = CodeBERTEncoder(
+            model_name="microsoft/codebert-base",
+            tune_last_n_layers=2,   # ここだけ finetune される
+        )
 
-        # 既存 conv ヘッド（もう使わないなら None のままでOK）
-        #self.conv = None
-        #if Conv is not None:
-        #    self.conv = Conv(**conv_args)
-
-        # ------------------------------------------------------------
-        # 2) ノードレベル Cross-Attention 融合ブロック
-        #    入力: [B, L, code_dim], [B, L, hidden_dim], mask [B, L]
-        #    出力: [B, L, fusion_out_dim]
-        # ------------------------------------------------------------
+        # GraphCodeFusion: code_dim を func_encoder.hidden_size に合わせる
         self.fusion = GraphCodeFusion(
-            code_dim=emb_size,
+            code_dim=self.func_encoder.hidden_size,
             graph_dim=hidden_dim,
             proj_dim=hidden_dim,
             num_heads=4,
             ffn_hidden_dim=hidden_dim * 4,
-            fusion_out_dim=hidden_dim,  # ノードごとに hidden_dim 次元を返す
+            fusion_out_dim=hidden_dim,
             dropout=0.1,
         )
 
-        # ------------------------------------------------------------
-        # 3) グラフレベルの分類層
-        #    （マスク付き平均プーリング後に 2 クラス logits）
-        # ------------------------------------------------------------
         self.classifier = nn.Linear(hidden_dim, 2)
 
+
     def forward(self, data):
-        """
-        data.x         : [N, emb_size]   CodeBERT ノード埋め込み
-        data.edge_index: [2, E]
-        data.edge_type : [E]
-        data.batch     : [N]            ノード→グラフID
-        """
-        x          = data.x          # [N, code_dim]
+        x          = data.x
         edge_index = data.edge_index
         edge_type  = data.edge_type
 
-        # ★ 1) 安全な batch ベクトルの再構成
+        # ★ node → graph インデックスを安全に作る
         if isinstance(data, GeoBatch) and hasattr(data, "ptr") and data.ptr is not None:
-            # ptr: [num_graphs+1], 差分が各グラフのノード数
-            num_nodes_per_graph = data.ptr[1:] - data.ptr[:-1]        # [B]
-            batch = torch.arange(num_nodes_per_graph.size(0), device=x.device).repeat_interleave(num_nodes_per_graph)
-        elif hasattr(data, "batch") and data.batch is not None:
-            batch = data.batch
+            # ptr: [0, n0, n0+n1, n0+n1+n2, ...]
+            num_nodes_per_graph = data.ptr[1:] - data.ptr[:-1]   # [B]
+            assert int(num_nodes_per_graph.sum().item()) == x.size(0), \
+                f"sum(ptr diff)={int(num_nodes_per_graph.sum().item())}, x.size(0)={x.size(0)} がズレてる"
+
+            batch_idx = torch.arange(num_nodes_per_graph.size(0), device=x.device) \
+                            .repeat_interleave(num_nodes_per_graph)   # [N_nodes]
         else:
-            # 単一グラフの場合など：全部 0 番グラフとして扱う
-            batch = x.new_zeros(x.size(0), dtype=torch.long)
+            # 単一グラフ or last resort
+            batch_idx = x.new_zeros(x.size(0), dtype=torch.long)
 
-        # 念のため整合チェック
-        if batch.size(0) != x.size(0):
-            # デバッグしやすいように assert ではなく調整するならこう
-            # ここでは「多いほうに合わせず、とりあえず小さいほうに合わせる」などもあり
-            min_n = min(batch.size(0), x.size(0))
-            batch = batch[:min_n]
-            x     = x[:min_n]
-            edge_index = edge_index[:, edge_index.max(dim=0).values < min_n]  # ざっくり調整（必要なら）
-
-
-        # ============================
-        # 1) R-GCN でノード埋め込み h を作る
-        # ============================
-        # 1) CodeBERT x → R-GCN h
+        # 1) R-GCN でノード埋め込み
         h = self.input_proj(x)
         for conv in self.rgcn_layers:
             h = F.relu(conv(h, edge_index, edge_type))
 
-        # 2) ノード列を [B, L, D] に（dense化）
-        code_dense, mask = to_dense_batch(x, batch)    # [B, L, code_dim], [B, L]
-        graph_dense, _   = to_dense_batch(h, batch)    # [B, L, hidden_dim]
+        
 
-        # 3) GraphCodeFusion で “グラフ表現” を直接もらう
-        graph_repr = self.fusion(code_dense, graph_dense, mask)  # [B, hidden_dim]
+        graph_dense, graph_mask = to_dense_batch(h, batch_idx)
+
+        # 2) 関数コードをトークナイズして CodeBERT に通す
+        funcs = getattr(data, "func", None)
+        if funcs is None:
+            print("func is None. That is why code mask is None. Tokenized code is composed of 0")
+            # 念のため保険：func がない場合は 0 ベクトル
+            B = graph_dense.size(0)
+            code_emb = graph_dense.new_zeros(B, 1, self.func_encoder.hidden_size)
+            code_mask = None
+        else:
+            # PyG の Batch では data.func は list[str] になっている想定
+            if isinstance(funcs, str):
+                funcs = [funcs]
+            enc = self.func_tokenizer(
+                list(funcs),
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,  # 必要に応じて調整
+            )
+            input_ids     = enc["input_ids"].to(self.device)
+            attention_mask = enc["attention_mask"].to(self.device)  # [B, L_code]
+
+            # ★ トークン列を取得（CLS ではない）
+            code_emb = self.func_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_cls=False,        # [B, L_code, H]
+            )
+            code_mask = attention_mask  # そのまま mask に使える
+
+        # 3) トークン列 vs ノード列で Cross-Attention
+        graph_repr = self.fusion(
+            code_emb=code_emb,              # [B, L_code, H]
+            graph_emb=graph_dense,          # [B, L_graph, D]
+            code_mask=code_mask,            # [B, L_code]
+            graph_mask=graph_mask,          # [B, L_graph]
+        )                                   # → [B, hidden_dim]
 
         # 4) 分類
-        logits = self.classifier(graph_repr)   # [B, 2]
+        logits = self.classifier(graph_repr)
         return logits
+
 
 
 # models/codebert_encoder.py
@@ -225,30 +232,37 @@ class CodeBERTEncoder(nn.Module):
     def __init__(self, model_name: str = "microsoft/codebert-base", tune_last_n_layers: int = 2):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
-        self.hidden_size = self.bert.config.hidden_size  # 768 or 769
+        self.hidden_size = self.bert.config.hidden_size
 
-        # ① 全層いったん凍結
+        # 全層いったん凍結
         for p in self.bert.parameters():
             p.requires_grad = False
 
-        # ② encoder の最後の n 層だけ解凍
-        encoder_layers = self.bert.encoder.layer  # nn.ModuleList
+        # encoder の最後の n 層だけ解凍（ここが finetune 対象）
+        encoder_layers = self.bert.encoder.layer
         for layer in encoder_layers[-tune_last_n_layers:]:
             for p in layer.parameters():
                 p.requires_grad = True
 
-        # ③ （必要なら）LayerNorm や pooler も解凍してよい
         if hasattr(self.bert, "pooler"):
             for p in self.bert.pooler.parameters():
                 p.requires_grad = True
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        return_cls: bool = True,
+    ):
         """
-        input_ids:      [N, L]
-        attention_mask: [N, L]
-        戻り値:         [N, hidden_size]  （CLS or 平均など）
+        return_cls=True なら [B, H] (CLS)、
+        False なら [B, L, H] (トークン列) を返す。
         """
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        # 通常は CLS を使う
-        cls = out.last_hidden_state[:, 0, :]  # [N, H]
-        return cls
+        last = out.last_hidden_state  # [B, L, H]
+
+        if return_cls:
+            return last[:, 0, :]      # [B, H]
+        else:
+            return last               # [B, L, H]
+

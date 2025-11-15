@@ -246,10 +246,12 @@ class GraphCodeFusion(nn.Module):
 
     def forward(
         self,
-        code_emb: torch.Tensor,
-        graph_emb: torch.Tensor,
-        mask: torch.Tensor | None = None,
+        code_emb: torch.Tensor,            # [B, L_code, code_dim]
+        graph_emb: torch.Tensor,           # [B, L_graph, graph_dim]
+        code_mask: torch.Tensor | None = None,   # [B, L_code]
+        graph_mask: torch.Tensor | None = None,  # [B, L_graph]
     ):
+
         """
         code_emb:  [B, L_code, code_dim]
         graph_emb:[B, L_graph, graph_dim]
@@ -278,17 +280,21 @@ class GraphCodeFusion(nn.Module):
         graph_out = self.norm_graph(graph_h + graph_ca)   # [B, Lg, D]
 
         # 4) プーリング（mask があれば “有効ノードだけ”）
-        if mask is not None:
-            mask_f = mask.float().unsqueeze(-1)     # [B, L, 1]
-            # to_dense_batch 由来なので、code / graph で同じ mask を想定
-            code_sum  = (code_out  * mask_f).sum(dim=1)          # [B, D]
-            graph_sum = (graph_out * mask_f).sum(dim=1)          # [B, D]
-            denom     = mask_f.sum(dim=1).clamp(min=1e-6)        # [B, 1]
-            code_vec  = code_sum  / denom                        # [B, D]
-            graph_vec = graph_sum / denom                        # [B, D]
+        if code_mask is not None:
+            code_mask_f = code_mask.float().unsqueeze(-1)        # [B, Lc, 1]
+            code_sum  = (code_out * code_mask_f).sum(dim=1)      # [B, D]
+            denom_c   = code_mask_f.sum(dim=1).clamp(min=1e-6)   # [B, 1]
+            code_vec  = code_sum / denom_c                       # [B, D]
         else:
-            code_vec  = code_out.mean(dim=1)   # [B, D]
-            graph_vec = graph_out.mean(dim=1)  # [B, D]
+            code_vec  = code_out.mean(dim=1)                     # [B, D]
+
+        if graph_mask is not None:
+            graph_mask_f = graph_mask.float().unsqueeze(-1)      # [B, Lg, 1]
+            graph_sum  = (graph_out * graph_mask_f).sum(dim=1)   # [B, D]
+            denom_g   = graph_mask_f.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+            graph_vec = graph_sum / denom_g                      # [B, D]
+        else:
+            graph_vec = graph_out.mean(dim=1)
 
         # 5) concat → FFN → LayerNorm → Linear
         fused = torch.cat([code_vec, graph_vec], dim=-1)  # [B, 2D]

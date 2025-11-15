@@ -127,7 +127,7 @@ def select(dataset: pd.DataFrame) -> pd.DataFrame:
     len_filter = dataset.func.str.len() < 1200
     result = dataset.loc[len_filter]
     # 開発中に重すぎる時の上限（必要なければコメントアウト）
-    result = result.head(1000)
+    #result = result.head(10000)
     return result
 
 def shuffle_df(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
@@ -264,6 +264,7 @@ def Embed_generator():
             for nodes in func_dicts:
                 # PyG Data を作成（既存の実装を利用）
                 g = process.nodes_to_input(nodes, row.target, context.nodes_dim, mode="codebert")
+                g.func = row.func
 
                 # ▼ 後段の同定に便利なメタデータは、あれば Data にも生やしておく
                 try:
@@ -689,22 +690,38 @@ def _split_file_paths(split: str):
             for f in all_files
             if f.startswith(f"{split}_") and f.endswith(f"_{FILES.input}")]
 
-def _count_targets_in_files(files):
+def _count_targets_in_files(files, require_input: bool = False):
+    """
+    files に含まれる train_*.pkl を走査して、
+    ・ラベル0/1の個数（input がある行だけを対象にできる）
+    を数えるヘルパ。
+    """
     cnt0 = cnt1 = 0
     for fn in files:
         try:
             df = pd.read_pickle(fn)
             if "target" not in df.columns:
                 continue
+
+            # ★ 学習に実際に使うのは input がある行だけなので、その行だけに絞る
+            if require_input and "input" in df.columns:
+                mask = df["input"].notna()
+                df = df.loc[mask]
+                if df.empty:
+                    continue
+
             vals = df["target"].astype("int64").clip(0, 1)
             c1 = int(vals.sum())
             c0 = int(len(vals) - c1)
-            cnt0 += c0; cnt1 += c1
+            cnt0 += c0
+            cnt1 += c1
+
             del df
             gc.collect()
         except Exception:
             continue
     return cnt0, cnt1
+
 
 # ------------------------------------------------------------
 # 公式 split 固定のローダ作成（*_input.pkl を読み込む）
@@ -771,15 +788,26 @@ if __name__ == '__main__':
     if args.mode == "train" and not train_files:
         raise RuntimeError("No training data found. Run with --cpg そして --embed を済ませてください。")
 
-    # クラス重み計算（軽量）
-    cnt0, cnt1 = _count_targets_in_files(train_files)
-    N = max(1, cnt0 + cnt1)
-    w0 = N / (2 * max(1, cnt0)); w1 = N / (2 * max(1, cnt1))
-    print(f"[ClassCount] num0={cnt0}, num1={cnt1} -> w0={w0:.4f}, w1={w1:.4f}")
-    class_weights = torch.tensor([w0, w1], dtype=torch.float, device=device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    # ★ 学習に実際に使う「有効サンプル数」を数える
+    #   - input が存在する行だけを対象にして
+    #   - BalancedStreamDataset で 0/1=1:1 にするので、1エポック ≒ 2 * min(cnt0, cnt1)
+    cnt0, cnt1 = _count_targets_in_files(train_files, require_input=True)
+    total_samples_raw = max(1, cnt0 + cnt1)
 
+    # ★ クラス重みを計算（頻度の逆数ベース）
+    #   - 片方が多いほど、そのクラスの重みを小さくする
+    freq0 = cnt0 / total_samples_raw
+    freq1 = cnt1 / total_samples_raw
+    w0 = 0.5 / freq0    # 0.5 は「両クラスの目標比率」
+    w1 = 0.5 / freq1
+
+    print(f"[ClassCount] num0={cnt0}, num1={cnt1}, "
+        f"raw_total={total_samples_raw}, w0={w0:.4f}, w1={w1:.4f}")
+
+    class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
     print("Using device:", device)
+    print("Class weights:", class_weights)
 
     # === モデル設定読み込み ===========================================
     BertModelCfg = configs.BertGGNN()
@@ -809,6 +837,7 @@ if __name__ == '__main__':
             print("=" * 80)
 
             # --- train_loader（BalancedStreamDataset を使用） ---
+            """
             balanced_ds = BalancedStreamDataset(
                 train_files,
                 batch_size=batch_size,
@@ -824,6 +853,16 @@ if __name__ == '__main__':
                 drop_last=False,
                 shuffle=False,  # BalancedStreamDataset 側で順序制御する
             )
+            """
+
+            # --- train_loader（全データ＋クラス重みで不均衡対策） ---
+            train_loader = make_stream_loader_for_split(
+                "train",
+                batch_size=batch_size,
+                buffer_size=max(128, batch_size * 8),
+                shuffle=True,   # ← train は真で OK
+            )
+
 
             # --- val_loader ---
             val_loader = make_stream_loader_for_split(
@@ -855,9 +894,9 @@ if __name__ == '__main__':
                 )
 
                 # Scheduler（Warmup + Linear Decay）
-                # IterableDataset なので len(train_loader) ではなく、事前に数えた N=cnt0+cnt1 から近似
-                total_samples = max(1, cnt0 + cnt1)  # train 全体のサンプル数（クラス重み計算で使ったやつ）
-                steps_per_epoch = math.ceil(total_samples / batch_size)
+                # ★ IterableDataset なので len(train_loader) ではなく、
+                #   BalancedStreamDataset の実効サンプル数を使って steps_per_epoch を近似
+                steps_per_epoch = math.ceil(total_samples_raw / batch_size)
                 total_steps = steps_per_epoch * NUM_EPOCHS
                 warmup_steps = int(0.1 * total_steps)
 
@@ -867,7 +906,8 @@ if __name__ == '__main__':
                         num_warmup_steps=warmup_steps,
                         num_training_steps=total_steps,
                     )
-                    print(f"[SCHED] total_steps={total_steps}, warmup_steps={warmup_steps}")
+                    print(f"[SCHED] total_steps={total_steps}, warmup_steps={warmup_steps}, "
+                        f"steps_per_epoch≈{steps_per_epoch}")
                 else:
                     scheduler = None
                     print("[WARN] total_steps が 0 のため Scheduler 無効")
@@ -888,20 +928,35 @@ if __name__ == '__main__':
                 )
 
                 for epoch in range(1, NUM_EPOCHS + 1):
+                    # --- 学習 ---
                     train(model, train_loader, optimizer, epoch, criterion, scheduler=scheduler)
 
                     if val_loader is not None:
+                        # ① まずは従来どおり「argmax（しきい値0.5）」で評価
                         acc, precision, recall, f1 = validate(model, val_loader)
 
                         history["epoch"].append(epoch)
                         history["val_acc"].append(acc)
                         history["val_prec"].append(precision)
                         history["val_rec"].append(recall)
-                        history["val_f1"].append(f1)
+                        history["val_f1"].append(f1)  # これは F1@0.5
 
-                        # F1 改善チェック
-                        if f1 > best_f1 + 1e-4:
-                            best_f1 = f1
+                        # ② Validation 上で「F1が最大になるしきい値」を探索
+                        best_t, best_stats = search_best_threshold(model, val_loader, num_steps=19)
+
+                        if best_stats is not None:
+                            acc_t, prec_t, rec_t, f1_t = best_stats
+                            f1_for_es = f1_t        # EarlyStopping 用
+                            used_threshold = best_t # ログ用
+                        else:
+                            # 念のため、探索に失敗したときは従来の F1 を使う
+                            f1_for_es = f1
+                            used_threshold = 0.5
+
+
+                        # ④ F1 改善チェック（EarlyStopping は「ベストしきい値の F1」で判定）
+                        if f1_for_es > best_f1 + 1e-4:
+                            best_f1 = f1_for_es
                             best_epoch = epoch
                             wait = 0
                             torch.save(model.state_dict(), str(SAVE_PATH))
@@ -910,9 +965,11 @@ if __name__ == '__main__':
                             wait += 1
                             saved_flag = ""
 
+                        # ⑤ ログには「F1@0.5」と「F1@best_t」の両方を出す
                         print(
                             f"Epoch {epoch}/{NUM_EPOCHS} | "
-                            f"Acc: {acc:.4f}, P: {precision:.4f}, R: {recall:.4f}, F1: {f1:.4f}, "
+                            f"Acc@0.5: {acc:.4f}, P@0.5: {precision:.4f}, R@0.5: {recall:.4f}, F1@0.5: {f1:.4f}, "
+                            f"F1@best_t({used_threshold:.2f}): {f1_for_es:.4f}, "
                             f"best F1: {best_f1:.4f} (epoch {best_epoch}){saved_flag} "
                             f"wait={wait}/{patience}"
                         )
@@ -920,9 +977,11 @@ if __name__ == '__main__':
                         if wait >= patience:
                             print(f"[EarlyStopping] no F1 improvement for {patience} epochs. Stop training.")
                             break
+
                     else:
                         # val_loader が無い場合は毎エポック上書きで保存
                         torch.save(model.state_dict(), str(SAVE_PATH))
+
 
                 # この (batch_size, lr) の結果を記録
                 all_results.append({
