@@ -12,6 +12,24 @@ except Exception:
     RobertaModel = None
 
 
+_NODES_EMBEDDERS = {}
+
+def get_nodes_embedding(nodes_dim: int, *, mode: str = "codebert"):
+    """
+    nodes_dim と mode ごとに NodesEmbedding を 1 回だけ生成して使い回す。
+    """
+    key = (int(nodes_dim), mode)
+    if key not in _NODES_EMBEDDERS:
+        _NODES_EMBEDDERS[key] = NodesEmbedding(
+            nodes_dim=int(nodes_dim),
+            max_len=128,
+            batch_size=32,
+            dtype=torch.float16,
+            mode=mode,
+        )
+    return _NODES_EMBEDDERS[key]
+
+
 # =========================
 # Nodes → node feature
 # =========================
@@ -208,15 +226,10 @@ def nodes_to_input(nodes, target, nodes_dim, *, mode: str = "codebert"):
     nodes_dim: 最大ノード数（パディング幅）
     mode: "codebert" | "fast"
     """
-    nodes_embedding = NodesEmbedding(
-        nodes_dim,
-        max_len=128,
-        batch_size=32,
-        dtype=torch.float16,
-        mode=mode,
-    )
-    x = nodes_embedding(nodes)                       # [nodes_dim, 1+768]; 先頭 n_real 行が実ノード
+    nodes_embedding = get_nodes_embedding(nodes_dim, mode=mode)
+    full_x = nodes_embedding(nodes)                       # [nodes_dim, 1+768]; 先頭 n_real 行が実ノード
     n_real = min(len(nodes), nodes_dim)
+    x = full_x[:n_real]
 
     edge_index, edge_type = build_edges_all(nodes)
 
