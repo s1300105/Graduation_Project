@@ -4,8 +4,6 @@ from sklearn.metrics import roc_curve, auc
 import seaborn as sns
 import torch
 import torch.nn.functional as F
-from models.LMGNN import BertGGCN
-import configs
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
 def test(model, device, test_loader):

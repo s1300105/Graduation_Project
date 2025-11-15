@@ -111,17 +111,44 @@ def _attach_edge(node_map, u, v, etype):
             n.edges[ekey] = _EdgeStub(etype, node_in=node_in, node_out=node_out)
 
 def _gather_nodes_from_ast_blocks(func_json, node_map):
-    # AST[*].nodes が無い場合もあるため、「あれば使う」方針
-    for blk in func_json.get("AST", []) or []:
-        for nd in blk.get("nodes", []) or []:
-            nid = str(nd.get("id"))
+    """
+    func_json["AST"] からノード属性を _NodeStub に写し込む。
+
+    Joern v4 の CPG 形式では、
+    - AST が「ノードのリスト」:  [ {id, properties, edges}, ... ]
+    - あるいは「ブロックのリスト」: [ {nodes: [...], edges: [...]}, ... ]
+    の2パターンがありうるので、両方に対応する。
+    """
+    ast_list = func_json.get("AST", []) or []
+
+    for ast_item in ast_list:
+        # パターン1: ast_item がブロックで、"nodes" の中にノードが入っている
+        nodes_in_item = ast_item.get("nodes")
+        if isinstance(nodes_in_item, list) and len(nodes_in_item) > 0:
+            iterable = nodes_in_item
+        else:
+            # パターン2: ast_item 自体がノード
+            iterable = [ast_item]
+
+        for nd in iterable:
+            nid_raw = nd.get("id")
+            if nid_raw is None:
+                continue
+
+            nid = str(nid_raw)
             code, line, col, ntype, label = _node_props_to_fields(nd)
-            _ensure_node(node_map, nid, template={
-                "code": code,
-                "line_number": line,
-                "column_number": col,
-                "type_name": ntype or label
-            })
+
+            _ensure_node(
+                node_map,
+                nid,
+                template={
+                    "code": code,
+                    "line_number": line,
+                    "column_number": col,
+                    "type_name": ntype or label,
+                },
+            )
+
 
 def _gather_edges_from_blocks(func_json, node_map):
     for kind in EDGE_KINDS:
