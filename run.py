@@ -39,6 +39,9 @@ from collections import deque
 import numpy as np
 from transformers import get_linear_schedule_with_warmup
 
+PLOT_DIR = Path("./plots")
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
 PATHS = configs.Paths()
 FILES = configs.Files()
 
@@ -336,6 +339,9 @@ def Embed_generator(resume: bool = False):
 
 def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
     model.train()
+    total_loss = 0.0
+    n_batches = 0
+
     for batch_idx, batch in enumerate(train_loader):
         try:
             batch = batch.to(device, non_blocking=True)
@@ -346,6 +352,10 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
             loss = criterion(y_pred, batch.y)
             loss.backward()
 
+            # ロス集計
+            total_loss += loss.item()
+            n_batches += 1
+
             if (batch_idx+1) % 200 == 0:
                 _diag_logits("train", y_pred, batch.y)
 
@@ -353,9 +363,9 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
             if scheduler is not None:
                 scheduler.step()
 
-            if (batch_idx + 1) % 100 == 0:
-                num_graphs = getattr(batch, "num_graphs", 1)
-                print(f'Train Epoch: {epoch} step {batch_idx+1} (+{num_graphs} graphs)\tLoss: {loss.item():.6f}')
+            #if (batch_idx + 1) % 100 == 0:
+            #    num_graphs = getattr(batch, "num_graphs", 1)
+            #    print(f'Train Epoch: {epoch} step {batch_idx+1} (+{num_graphs} graphs)\tLoss: {loss.item():.6f}')
         except RuntimeError as e:
             # まれな CUDA OOM をスキップして進行
             if "out of memory" in str(e).lower():
@@ -365,12 +375,16 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
                 continue
             raise
 
+    avg_loss = total_loss / max(1, n_batches)
+    print(f"[Train] Epoch {epoch} avg_loss={avg_loss:.6f}")
+    return avg_loss
 
-# ==== 修正済み validate ====
-def validate(model, val_loader):
+
+
+def validate(model, val_loader, plot_prefix: str = "val"):
     if val_loader is None:
         print("[WARN] validate() called with None loader. Skipped.")
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0  # avg_loss, acc, prec, rec, f1
 
     model.eval()
     total_loss = 0.0
@@ -398,7 +412,6 @@ def validate(model, val_loader):
             # ★ ロジット診断を逐次更新
             _diag_logits_update(diag_state, logits, batch.y)
 
-    # IterableDataLoader 対応: バッチ数で割る
     avg_loss = total_loss / max(1, n_batches)
 
     accuracy = accuracy_score(y_true, y_pred_labels)
@@ -406,29 +419,29 @@ def validate(model, val_loader):
     recall = recall_score(y_true, y_pred_labels, zero_division=0)
     f1 = f1_score(y_true, y_pred_labels, zero_division=0)
 
-    # 混同行列を保存
+    # 混同行列を保存（plots/ 配下に）
     cm = confusion_matrix(y_true, y_pred_labels)
     plt.figure(figsize=(6, 5))
     plt.imshow(cm)
     plt.xlabel('Predicted')
     plt.ylabel('True')
-    plt.title('Confusion Matrix (Val)')
+    plt.title(f'Confusion Matrix ({plot_prefix})')
     plt.tight_layout()
-    plt.savefig('confusion_matrix_val.png')
+    plt.savefig(PLOT_DIR / f'confusion_matrix_{plot_prefix}.png')
     plt.close()
 
     # ★ ロジット診断を出力（平均確率/信頼度・クラス偏りなど）
-    _diag_logits_report("val", diag_state)
+    _diag_logits_report(plot_prefix, diag_state)
 
     print('Val: Average loss: {:.4f}, Accuracy: {:.2f}%, Precision: {:.2f}%, Recall: {:.2f}%, F1: {:.2f}%'.format(
         avg_loss, accuracy * 100, precision * 100, recall * 100, f1 * 100
     ))
-    return accuracy, precision, recall, f1
-# ==== ここまで ====
+    return avg_loss, accuracy, precision, recall, f1
 
 
 
-def test(model, test_loader):
+
+def test(model, test_loader, plot_prefix: str = "test"):
     model.eval()
     total_loss = 0.0
     n_batches = 0
@@ -455,7 +468,20 @@ def test(model, test_loader):
     print('Test: Average loss: {:.4f}, Acc: {:.2f}%, P: {:.2f}%, R: {:.2f}%, F1: {:.2f}%'.format(
         avg_loss, accuracy*100, precision*100, recall*100, f1*100
     ))
+
+    # 混同行列の画像も保存
+    cm = confusion_matrix(y_true, y_pred_labels)
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(f'Confusion Matrix ({plot_prefix})')
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / f'confusion_matrix_{plot_prefix}.png')
+    plt.close()
+
     return accuracy, precision, recall, f1
+
 
 
 def _collect_probs_and_labels(model, loader):
@@ -654,17 +680,18 @@ def _diag_logits_report(stage: str, state):
             plt.hist(state["p1_vals"], bins=20)
             plt.title(f'P(class=1) Histogram [{stage}]')
             plt.tight_layout()
-            plt.savefig(f'val_p1_hist_{stage}.png')
+            plt.savefig(PLOT_DIR / f'val_p1_hist_{stage}.png')
             plt.close()
         if state["conf_vals"]:
             plt.figure(figsize=(4,3))
             plt.hist(state["conf_vals"], bins=20)
             plt.title(f'Confidence Histogram [{stage}]')
             plt.tight_layout()
-            plt.savefig(f'val_conf_hist_{stage}.png')
+            plt.savefig(PLOT_DIR / f'val_conf_hist_{stage}.png')
             plt.close()
     except Exception:
         pass
+
 # ==== ここまでヘルパ ====
 
 
@@ -937,7 +964,16 @@ if __name__ == '__main__':
                 wait = 0
 
                 # ログ用 history（この組み合わせ専用）
-                history = {"epoch": [], "val_acc": [], "val_prec": [], "val_rec": [], "val_f1": []}
+                history = {
+                    "epoch": [],
+                    "train_loss": [],
+                    "val_loss": [],
+                    "val_acc": [],
+                    "val_prec": [],
+                    "val_rec": [],
+                    "val_f1": [],
+                }
+
 
                 # 保存ファイル名（バッチとLRを含める）
                 lr_str = f"{lr:.0e}"  # 例: 1e-04
@@ -948,13 +984,16 @@ if __name__ == '__main__':
 
                 for epoch in range(1, NUM_EPOCHS + 1):
                     # --- 学習 ---
-                    train(model, train_loader, optimizer, epoch, criterion, scheduler=scheduler)
+                    train_loss = train(model, train_loader, optimizer, epoch, criterion, scheduler=scheduler)
 
                     if val_loader is not None:
-                        # ① まずは従来どおり「argmax（しきい値0.5）」で評価
-                        acc, precision, recall, f1 = validate(model, val_loader)
+                        # prefix には batch_size, lr, epoch など入れておくと区別しやすい
+                        plot_prefix = f"val_bs{batch_size}_lr{lr_str}_ep{epoch}"
+                        val_loss, acc, precision, recall, f1 = validate(model, val_loader, plot_prefix=plot_prefix)
 
                         history["epoch"].append(epoch)
+                        history["train_loss"].append(train_loss)
+                        history["val_loss"].append(val_loss)
                         history["val_acc"].append(acc)
                         history["val_prec"].append(precision)
                         history["val_rec"].append(recall)
@@ -1013,8 +1052,21 @@ if __name__ == '__main__':
 
                 # 簡単な学習曲線を保存 (組み合わせごとに別ファイル)
                 if history["epoch"]:
-                    import matplotlib.pyplot as plt
+                    
 
+                    # ① Loss 曲線
+                    plt.figure(figsize=(6,4))
+                    plt.plot(history["epoch"], history["train_loss"], label="Train Loss")
+                    plt.plot(history["epoch"], history["val_loss"], label="Val Loss")
+                    plt.xlabel("Epoch")
+                    plt.ylabel("Loss")
+                    plt.legend()
+                    plt.grid(True)
+                    plt.tight_layout()
+                    plt.savefig(PLOT_DIR / f"loss_curve_bs{batch_size}_lr{lr_str}.png")
+                    plt.close()
+
+                    # ② Val の F1 / Recall / Precision
                     plt.figure(figsize=(6,4))
                     plt.plot(history["epoch"], history["val_f1"], label="Val F1")
                     plt.plot(history["epoch"], history["val_rec"], label="Val Recall")
@@ -1025,9 +1077,10 @@ if __name__ == '__main__':
                     plt.legend()
                     plt.grid(True)
                     plt.tight_layout()
-                    plt.savefig(f"training_metrics_bs{batch_size}_lr{lr_str}.png")
+                    plt.savefig(PLOT_DIR / f"training_metrics_bs{batch_size}_lr{lr_str}.png")
                     plt.close()
 
+                    # ③ Val Accuracy
                     plt.figure(figsize=(6,4))
                     plt.plot(history["epoch"], history["val_acc"], label="Val Acc")
                     plt.xlabel("Epoch")
@@ -1035,8 +1088,9 @@ if __name__ == '__main__':
                     plt.ylim(0.0, 1.0)
                     plt.grid(True)
                     plt.tight_layout()
-                    plt.savefig(f"training_acc_bs{batch_size}_lr{lr_str}.png")
+                    plt.savefig(PLOT_DIR / f"training_acc_bs{batch_size}_lr{lr_str}.png")
                     plt.close()
+
 
         # 全体の結果を表示
         print("\n===== SWEEP SUMMARY (sorted by best_f1) =====")
