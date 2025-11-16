@@ -236,45 +236,64 @@ def CPG_generator():
 # ------------------------------------------------------------
 # CPG -> PyG Data 入力（CodeBERT埋め込みを含む）
 # ------------------------------------------------------------
-def Embed_generator():
+def Embed_generator(resume: bool = False):
     context = configs.Embed()
-    if Path(PATHS.input).exists():  
-        shutil.rmtree(PATHS.input)  
-    Path(PATHS.input).mkdir(parents=True, exist_ok=True)
 
-    if Path(PATHS.tokens).exists():
-        shutil.rmtree(PATHS.tokens)
-    Path(PATHS.tokens).mkdir(parents=True, exist_ok=True)
+    # --- ディレクトリの扱い ---
+    if not resume:
+        # フル再生成モード → 既存の input/tokens を全部消す
+        if Path(PATHS.input).exists():
+            shutil.rmtree(PATHS.input)
+        Path(PATHS.input).mkdir(parents=True, exist_ok=True)
 
-    dataset_files = data.get_directory_files(PATHS.cpg)  # 例: ["train_0_cpg.pkl", "valid_0_cpg.pkl", "test_0_cpg.pkl", ...]
+        if Path(PATHS.tokens).exists():
+            shutil.rmtree(PATHS.tokens)
+        Path(PATHS.tokens).mkdir(parents=True, exist_ok=True)
+    else:
+        # 再開モード → 既存は消さずに、そのまま使う
+        Path(PATHS.input).mkdir(parents=True, exist_ok=True)
+        Path(PATHS.tokens).mkdir(parents=True, exist_ok=True)
+
+    # すでに作成ずみの *_input.pkl の stem を集める
+    existing_input_stems = set()
+    for f in data.get_directory_files(PATHS.input):  # 例: ["train_0_input.pkl", ...]
+        if f.endswith(f"_{FILES.input}"):
+            # 例: "train_0_input.pkl" → "train_0_input" → "train_0_cpg" と合わせたいなら
+            stem = f[: -len(f"_" + FILES.input)]  # "train_0"
+            existing_input_stems.add(stem)
+
+    dataset_files = data.get_directory_files(PATHS.cpg)  # ["train_0_cpg.pkl", "train_1_cpg.pkl", ...]
 
     for pkl_file in dataset_files:
-        # 例: pkl_file = "train_0_cpg.pkl" -> file_stem = "train_0_cpg"
-        file_stem = pkl_file.split(".")[0]
-        cpg_dataset = data.load(PATHS.cpg, pkl_file)  # DataFrame: ["Index","cpg", ("func","commit_id","project"...があることも)]
+        # 例: "train_0_cpg.pkl" → "train_0_cpg" → "train_0"
+        file_stem_full = pkl_file.split(".")[0]       # "train_0_cpg"
+        base_stem = file_stem_full.rsplit("_", 1)[0]  # "train_0"
 
-        # 既存のトークナイズ処理を維持（必要なら後で使う／可視化用）
+        # 再開モードのとき、既に対応する *_input.pkl があればスキップ
+        if resume and base_stem in existing_input_stems:
+            print(f"[RESUME] skip already processed: {base_stem}")
+            continue
+
+        print(f"[INFO] processing CPG: {pkl_file}")
+        cpg_dataset = data.load(PATHS.cpg, pkl_file)
+
+        # --- トークンも再開したければ同様にスキップ処理を入れてOK ---
         tokens_dataset = data.tokenize(cpg_dataset)
-        data.write(tokens_dataset, PATHS.tokens, f"{file_stem}_{FILES.tokens}")
+        data.write(tokens_dataset, PATHS.tokens, f"{file_stem_full}_{FILES.tokens}")
 
         rows = []
-        # cpg_dataset の各行 = 関数単位のCPG（"Index" が関数ID）
         for _, row in cpg_dataset.iterrows():
             func_dicts = parse_to_functions(row.cpg, max_nodes=context.nodes_dim)
             for nodes in func_dicts:
-                # PyG Data を作成（既存の実装を利用）
                 g = process.nodes_to_input(nodes, row.target, context.nodes_dim, mode="codebert")
                 g.func = row.func
 
-                # ▼ 後段の同定に便利なメタデータは、あれば Data にも生やしておく
                 try:
                     if "commit_id" in row:
                         setattr(g, "commit_id", row["commit_id"])
                 except Exception:
                     pass
                 try:
-                    # JSON→CPG復元時に "Index" が関数IDとして付いている想定
-                    # なければ row.get("idx") をフォールバック
                     _idx = int(row["Index"]) if "Index" in row and pd.notna(row["Index"]) else int(row.get("idx", -1))
                     setattr(g, "idx", _idx)
                 except Exception:
@@ -297,7 +316,6 @@ def Embed_generator():
 
                 rows.append(out_row)
 
-        # 出力列は存在するキーで構成（固定カラム＋任意カラム）
         base_cols = ["input", "target", "func"]
         extra_cols = []
         if rows:
@@ -307,12 +325,13 @@ def Embed_generator():
                     extra_cols.append(k)
 
         out_df = pd.DataFrame(rows, columns=base_cols + extra_cols)
-        print(f"[INFO] saving INPUT rows={len(out_df)}  file={file_stem}_{FILES.input}")
+        out_name = f"{base_stem}_{FILES.input}"   # 例: "train_0_input.pkl"
+        print(f"[INFO] saving INPUT rows={len(out_df)}  file={out_name}")
         if len(out_df) == 0:
             print("[WARN] No functions parsed from this CPG chunk. Check parser/filter settings.")
 
-        # 例: "train_0_cpg" → "train_0_input.pkl"
-        data.write(out_df, PATHS.input, f"{file_stem}_{FILES.input}")
+        data.write(out_df, PATHS.input, out_name)
+
 
 
 def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
@@ -778,7 +797,7 @@ if __name__ == '__main__':
     if args.cpg:
         CPG_generator()
     if args.embed:
-        Embed_generator()
+        Embed_generator(resume=False)
 
     # === 公式 split 固定で入力をロード ===
     context = configs.Process()

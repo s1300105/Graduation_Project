@@ -97,13 +97,9 @@ class NodesEmbedding:
 
         nodes_tensor = torch.from_numpy(emb_np).float()  # CPU, fp32
 
-        # 前回より短いグラフが来た時に残りが汚れないようゼロ埋め
-        self.target.zero_()
-        n = min(nodes_tensor.size(0), self.nodes_dim)
-        if n > 0:
-            self.target[:n, :] = nodes_tensor[:n, :]
+        
 
-        return self.target
+        return nodes_tensor
 
     # ========= fastモード =========
     def _embed_nodes_fast(self, nodes):
