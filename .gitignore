@@ -104,3 +104,5 @@ data/data_review.ipynb
 data/cpg_dataset_verifier_eb96b0.ipynb
 # Large generated artifacts
 data/inspect/*.json
+data/inspect/
+data/*.ipynb
