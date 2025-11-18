@@ -46,9 +46,9 @@ PATHS = configs.Paths()
 FILES = configs.Files()
 
 # 公式配布の分割データ
-train_path = "/home/yudai/Project/research/Vul_Detection/data/raw/new_six_by_projects/train.jsonl"
-valid_path = "/home/yudai/Project/research/Vul_Detection/data/raw/new_six_by_projects/valid.jsonl"
-test_path  = "/home/yudai/Project/research/Vul_Detection/data/raw/new_six_by_projects/test.jsonl"
+train_path = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/train.jsonl"
+valid_path = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/valid.jsonl"
+test_path  = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/test.jsonl"
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -611,6 +611,21 @@ class StreamGraphDataset(IterableDataset):
                 yield item
             buffer.clear()
 
+class LimitedStreamDataset(IterableDataset):
+    """基底 IterableDataset から max_samples 件だけ流すラッパ"""
+    def __init__(self, base_dataset: IterableDataset, max_samples: int):
+        super().__init__()
+        self.base_dataset = base_dataset
+        self.max_samples = int(max_samples)
+
+    def __iter__(self):
+        it = iter(self.base_dataset)
+        for i, item in enumerate(it):
+            if i >= self.max_samples:
+                break
+            yield item
+
+
 def _diag_logits(name, logits, y):
     with torch.no_grad():
         probs = logits.softmax(dim=-1)
@@ -700,12 +715,24 @@ def pyg_collate(batch_list):
     return Batch.from_data_list(batch_list)
 
 
-def make_stream_loader_for_split(split: str, *, batch_size: int, buffer_size: int, shuffle: bool):
+def make_stream_loader_for_split(
+    split: str,
+    *,
+    batch_size: int,
+    buffer_size: int,
+    shuffle: bool,
+    max_samples: int | None = None,
+):
     files = _split_file_paths(split)
     if not files:
         return None
+
     ds = StreamGraphDataset(files, buffer_size=buffer_size, shuffle=shuffle)
-    # まずはワーカ0（プロセス分の常駐メモリを避ける）
+
+    # ★ サブセット指定があれば、最大 max_samples 件で打ち切る
+    if max_samples is not None and max_samples > 0:
+        ds = LimitedStreamDataset(ds, max_samples)
+
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -819,6 +846,21 @@ if __name__ == '__main__':
     parser.add_argument('-embed', '--embed', action='store_true', help='Embedding generation task')
     parser.add_argument('-mode', '--mode', default="train", help='train / test')
     parser.add_argument('-path', '--path', default=None, help='model path or dir')
+
+    # ★ 追加：HPチューニング用サブセット設定
+    parser.add_argument(
+        '--subset_frac',
+        type=float,
+        default=0.10,
+        help='train のうち何割を 1 epoch で使うか (0<frac<=1, 例: 0.1%)'
+    )
+
+    parser.add_argument(
+        '--no_subset',
+        action='store_true',
+        help='サブセットを使わず、train 全体を 1 epoch で使う'
+    )
+
     args = parser.parse_args()
 
     if args.cpg:
@@ -831,29 +873,7 @@ if __name__ == '__main__':
 
     # --- train: ストリーミング用のファイルリスト ---
     train_files = _split_file_paths("train")
-    if args.mode == "train" and not train_files:
-        raise RuntimeError("No training data found. Run with --cpg そして --embed を済ませてください。")
-
-    # ★ 学習に実際に使う「有効サンプル数」を数える
-    #   - input が存在する行だけを対象にして
-    #   - BalancedStreamDataset で 0/1=1:1 にするので、1エポック ≒ 2 * min(cnt0, cnt1)
-    cnt0, cnt1 = _count_targets_in_files(train_files, require_input=True)
-    total_samples_raw = max(1, cnt0 + cnt1)
-
-    # ★ クラス重みを計算（頻度の逆数ベース）
-    #   - 片方が多いほど、そのクラスの重みを小さくする
-    freq0 = cnt0 / total_samples_raw
-    freq1 = cnt1 / total_samples_raw
-    w0 = 0.5 / freq0    # 0.5 は「両クラスの目標比率」
-    w1 = 0.5 / freq1
-
-    print(f"[ClassCount] num0={cnt0}, num1={cnt1}, "
-        f"raw_total={total_samples_raw}, w0={w0:.4f}, w1={w1:.4f}")
-
-    class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    print("Using device:", device)
-    print("Class weights:", class_weights)
+    
 
     # === モデル設定読み込み ===========================================
     BertModelCfg = configs.BertGGNN()
@@ -867,236 +887,296 @@ if __name__ == '__main__':
     if args.mode == "train":
         if not train_files:
             raise RuntimeError("train split が空です。")
+        
+        # ★ 学習に実際に使う「有効サンプル数」を数える
+        cnt0, cnt1 = _count_targets_in_files(train_files, require_input=True)
+        total_samples_raw = max(1, cnt0 + cnt1)
+
+        if cnt0 == 0 or cnt1 == 0:
+            print(f"[WARN] cnt0={cnt0}, cnt1={cnt1}. クラス重みを 1.0 に固定します。")
+            class_weights = torch.tensor([1.0, 1.0], dtype=torch.float32, device=device)
+        else:
+            freq0 = cnt0 / total_samples_raw
+            freq1 = cnt1 / total_samples_raw
+            w0 = 0.5 / freq0
+            w1 = 0.5 / freq1
+
+            print(
+                f"[ClassCount] num0={cnt0}, num1={cnt1}, "
+                f"raw_total={total_samples_raw}, w0={w0:.4f}, w1={w1:.4f}"
+            )
+            class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+
+        criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+        print("Class weights:", class_weights)
+
+        # ★★ ここから：HPチューニング用のサブセットサイズを決定 ★★
+        if args.no_subset:
+            effective_samples = total_samples_raw
+            print(f"[Subset] Disabled. Use ALL {total_samples_raw} train samples per epoch.")
+        else:
+            frac = max(0.0, min(args.subset_frac, 1.0))
+            if frac <= 0.0:
+                effective_samples = total_samples_raw
+                print(f"[Subset] subset_frac<=0 → 全サンプル使用 ({total_samples_raw})")
+            else:
+                effective_samples = int(total_samples_raw * frac)
+                effective_samples = max(1, effective_samples)  # 最低1は確保
+
+            print(
+                f"[Subset] total_samples_raw={total_samples_raw}, "
+                f"subset_frac={frac}, "
+                f"effective_samples_per_epoch={effective_samples}"
+            )
 
         # 探索するバッチサイズと学習率の候補
         batch_candidates = [8, 16, 32]
         lr_candidates = [1e-4, 5e-5, 3e-5, 1e-5]
 
+        # ★ CodeBERT 用の lr 比率
+        bert_lr_ratios = [0.1, 0.2, 0.3]
+
         patience = 5
         NUM_EPOCHS = context.epochs
 
-        all_results = []  # (batch, lr, best_f1, best_epoch) を記録
+        all_results = []  # (batch, lr, bert_ratio, ...) を記録
 
         for batch_size in batch_candidates:
             print("=" * 80)
             print(f"[SWEEP] Start batch_size={batch_size}")
             print("=" * 80)
 
-            # --- train_loader（BalancedStreamDataset を使用） ---
-            """
-            balanced_ds = BalancedStreamDataset(
-                train_files,
-                batch_size=batch_size,
-                buffer_size=max(128, batch_size * 8),
-                shuffle=True,
-            )
-            train_loader = GeoDataLoader(
-                balanced_ds,
-                batch_size=batch_size,
-                collate_fn=pyg_collate,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=False,
-                shuffle=False,  # BalancedStreamDataset 側で順序制御する
-            )
-            """
-
-            # --- train_loader（全データ＋クラス重みで不均衡対策） ---
+            # --- train_loader（HPチューニング用サブセットを使用） ---
             train_loader = make_stream_loader_for_split(
                 "train",
                 batch_size=batch_size,
                 buffer_size=max(128, batch_size * 8),
-                shuffle=True,   # ← train は真で OK
+                shuffle=True,   # train はシャッフル
+                max_samples=effective_samples,  # ★ ここがポイント
             )
-
 
             # --- val_loader ---
             val_loader = make_stream_loader_for_split(
                 "valid",
                 batch_size=batch_size,
                 buffer_size=max(64, batch_size * 4),
-                shuffle=False
+                shuffle=False,
             )
 
             if val_loader is None:
                 print("[WARN] valid split が空です。検証なしで学習を続行します。")
 
-            # 学習率スイープ
+            # 学習率 × bert_ratio スイープ
             for lr in lr_candidates:
-                print("-" * 60)
-                print(f"[SWEEP] batch_size={batch_size}, lr={lr}")
-                print("-" * 60)
+                for bert_ratio in bert_lr_ratios:
+                    print("-" * 60)
+                    print(f"[SWEEP] batch_size={batch_size}, lr={lr}, bert_lr_ratio={bert_ratio}")
+                    print("-" * 60)
 
-                # モデルを新規に構築
-                model = BertRGCN(gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv).to(device)
+                    # モデルを新規に構築（毎回リセット）
+                    model = BertRGCN(
+                        gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv
+                    ).to(device)
 
-                 # Optimizer
-                wd = 5e-4
-                print(f"[OPTIM] AdamW lr={lr}, weight_decay={wd}")
-                optimizer = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=lr,
-                    weight_decay=wd,
-                )
+                    # --- Optimizer: CodeBERT とそれ以外で lr を分ける ---
+                    wd = 5e-4
+                    base_lr = lr
+                    bert_lr = lr * bert_ratio
 
-                # Scheduler（Warmup + Linear Decay）
-                # ★ IterableDataset なので len(train_loader) ではなく、
-                #   BalancedStreamDataset の実効サンプル数を使って steps_per_epoch を近似
-                steps_per_epoch = math.ceil(total_samples_raw / batch_size)
-                total_steps = steps_per_epoch * NUM_EPOCHS
-                warmup_steps = int(0.1 * total_steps)
+                    bert_params = []
+                    non_bert_params = []
+                    for name, p in model.named_parameters():
+                        if not p.requires_grad:
+                            continue
+                        # ★ CodeBERT 部分のパラメータ名で判定（LMGNN.py の定義に合わせる）
+                        if "func_encoder.bert" in name:
+                            bert_params.append(p)
+                        else:
+                            non_bert_params.append(p)
 
-                if total_steps > 0:
-                    scheduler = get_linear_schedule_with_warmup(
-                        optimizer,
-                        num_warmup_steps=warmup_steps,
-                        num_training_steps=total_steps,
+                    param_groups = []
+                    if non_bert_params:
+                        param_groups.append({"params": non_bert_params, "lr": base_lr})
+                    if bert_params:
+                        param_groups.append({"params": bert_params, "lr": bert_lr})
+
+                    print(f"[OPTIM] AdamW base_lr={base_lr}, bert_lr={bert_lr}, weight_decay={wd}")
+                    optimizer = torch.optim.AdamW(
+                        param_groups,
+                        weight_decay=wd,
                     )
-                    print(f"[SCHED] total_steps={total_steps}, warmup_steps={warmup_steps}, "
-                        f"steps_per_epoch≈{steps_per_epoch}")
-                else:
-                    scheduler = None
-                    print("[WARN] total_steps が 0 のため Scheduler 無効")
 
-                # EarlyStopping 用
-                best_f1 = 0.0
-                best_epoch = 0
-                wait = 0
+                    # --- Scheduler（Warmup + Linear Decay） ---
+                    # ★ サブセットを使っているので effective_samples を使う
+                    steps_per_epoch = math.ceil(effective_samples / batch_size)
+                    total_steps = steps_per_epoch * NUM_EPOCHS
+                    warmup_steps = int(0.1 * total_steps)
 
-                # ログ用 history（この組み合わせ専用）
-                history = {
-                    "epoch": [],
-                    "train_loss": [],
-                    "val_loss": [],
-                    "val_acc": [],
-                    "val_prec": [],
-                    "val_rec": [],
-                    "val_f1": [],
-                }
-
-
-                # 保存ファイル名（バッチとLRを含める）
-                lr_str = f"{lr:.0e}"  # 例: 1e-04
-                SAVE_PATH = _resolve_save_path(
-                    args.path,
-                    filename=f"bert_rgcn_bs{batch_size}_lr{lr_str}.pth"
-                )
-
-                for epoch in range(1, NUM_EPOCHS + 1):
-                    # --- 学習 ---
-                    train_loss = train(model, train_loader, optimizer, epoch, criterion, scheduler=scheduler)
-
-                    if val_loader is not None:
-                        # prefix には batch_size, lr, epoch など入れておくと区別しやすい
-                        plot_prefix = f"val_bs{batch_size}_lr{lr_str}_ep{epoch}"
-                        val_loss, acc, precision, recall, f1 = validate(model, val_loader, plot_prefix=plot_prefix)
-
-                        history["epoch"].append(epoch)
-                        history["train_loss"].append(train_loss)
-                        history["val_loss"].append(val_loss)
-                        history["val_acc"].append(acc)
-                        history["val_prec"].append(precision)
-                        history["val_rec"].append(recall)
-                        history["val_f1"].append(f1)  # これは F1@0.5
-
-                        # ② Validation 上で「F1が最大になるしきい値」を探索
-                        best_t, best_stats = search_best_threshold(model, val_loader, num_steps=19)
-
-                        if best_stats is not None:
-                            acc_t, prec_t, rec_t, f1_t = best_stats
-                            f1_for_es = f1_t        # EarlyStopping 用
-                            used_threshold = best_t # ログ用
-                        else:
-                            # 念のため、探索に失敗したときは従来の F1 を使う
-                            f1_for_es = f1
-                            used_threshold = 0.5
-
-
-                        # ④ F1 改善チェック（EarlyStopping は「ベストしきい値の F1」で判定）
-                        if f1_for_es > best_f1 + 1e-4:
-                            best_f1 = f1_for_es
-                            best_epoch = epoch
-                            wait = 0
-                            torch.save(model.state_dict(), str(SAVE_PATH))
-                            saved_flag = " [SAVED]"
-                        else:
-                            wait += 1
-                            saved_flag = ""
-
-                        # ⑤ ログには「F1@0.5」と「F1@best_t」の両方を出す
+                    if total_steps > 0:
+                        scheduler = get_linear_schedule_with_warmup(
+                            optimizer,
+                            num_warmup_steps=warmup_steps,
+                            num_training_steps=total_steps,
+                        )
                         print(
-                            f"Epoch {epoch}/{NUM_EPOCHS} | "
-                            f"Acc@0.5: {acc:.4f}, P@0.5: {precision:.4f}, R@0.5: {recall:.4f}, F1@0.5: {f1:.4f}, "
-                            f"F1@best_t({used_threshold:.2f}): {f1_for_es:.4f}, "
-                            f"best F1: {best_f1:.4f} (epoch {best_epoch}){saved_flag} "
-                            f"wait={wait}/{patience}"
+                            f"[SCHED] total_steps={total_steps}, warmup_steps={warmup_steps}, "
+                            f"steps_per_epoch≈{steps_per_epoch}"
+                        )
+                    else:
+                        scheduler = None
+
+                    # --- ログ・保存用の文字列（ファイル名に ratio も入れる） ---
+                    lr_str = f"{lr:.0e}"                             # 例: 1e-04
+                    ratio_str = f"{bert_ratio:.2f}".replace(".", "p")  # 0.20 → '0p20'
+
+                    history = {
+                        "epoch": [],
+                        "train_loss": [],
+                        "val_loss": [],
+                        "val_acc": [],
+                        "val_prec": [],
+                        "val_rec": [],
+                        "val_f1": [],
+                    }
+
+                    SAVE_PATH = _resolve_save_path(
+                        args.path,
+                        filename=f"bert_rgcn_bs{batch_size}_lr{lr_str}_br{ratio_str}.pth",
+                    )
+
+                    best_f1 = -1.0
+                    best_epoch = -1
+                    wait = 0
+
+                    for epoch in range(1, NUM_EPOCHS + 1):
+                        # --- 学習 ---
+                        train_loss = train(
+                            model, train_loader, optimizer, epoch, criterion, scheduler=scheduler
                         )
 
-                        if wait >= patience:
-                            print(f"[EarlyStopping] no F1 improvement for {patience} epochs. Stop training.")
-                            break
+                        if val_loader is not None:
+                            plot_prefix = f"val_bs{batch_size}_lr{lr_str}_br{ratio_str}_ep{epoch}"
+                            val_loss, acc, precision, recall, f1 = validate(
+                                model, val_loader, plot_prefix=plot_prefix
+                            )
 
-                    else:
-                        # val_loader が無い場合は毎エポック上書きで保存
-                        torch.save(model.state_dict(), str(SAVE_PATH))
+                            history["epoch"].append(epoch)
+                            history["train_loss"].append(train_loss)
+                            history["val_loss"].append(val_loss)
+                            history["val_acc"].append(acc)
+                            history["val_prec"].append(precision)
+                            history["val_rec"].append(recall)
+                            history["val_f1"].append(f1)
 
+                            # ② Validation 上で「F1が最大になるしきい値」を探索
+                            best_t, best_stats = search_best_threshold(
+                                model, val_loader, num_steps=19
+                            )
 
-                # この (batch_size, lr) の結果を記録
-                all_results.append({
-                    "batch_size": batch_size,
-                    "lr": lr,
-                    "best_f1": float(best_f1),
-                    "best_epoch": int(best_epoch),
-                    "model_path": str(SAVE_PATH),
-                })
+                            if best_stats is not None:
+                                acc_t, prec_t, rec_t, f1_t = best_stats
+                                f1_for_es = f1_t        # EarlyStopping 用
+                                used_threshold = best_t # ログ用
+                            else:
+                                # 念のため、探索に失敗したときは従来の F1 を使う
+                                f1_for_es = f1
+                                used_threshold = 0.5
 
-                # 簡単な学習曲線を保存 (組み合わせごとに別ファイル)
-                if history["epoch"]:
-                    
+                            # ④ F1 改善チェック（EarlyStopping は「ベストしきい値の F1」で判定）
+                            if f1_for_es > best_f1 + 1e-4:
+                                best_f1 = f1_for_es
+                                best_epoch = epoch
+                                wait = 0
+                                torch.save(model.state_dict(), str(SAVE_PATH))
+                                saved_flag = " [SAVED]"
+                            else:
+                                wait += 1
+                                saved_flag = ""
 
-                    # ① Loss 曲線
-                    plt.figure(figsize=(6,4))
-                    plt.plot(history["epoch"], history["train_loss"], label="Train Loss")
-                    plt.plot(history["epoch"], history["val_loss"], label="Val Loss")
-                    plt.xlabel("Epoch")
-                    plt.ylabel("Loss")
-                    plt.legend()
-                    plt.grid(True)
-                    plt.tight_layout()
-                    plt.savefig(PLOT_DIR / f"loss_curve_bs{batch_size}_lr{lr_str}.png")
-                    plt.close()
+                            # ⑤ ログには「F1@0.5」と「F1@best_t」の両方を出す
+                            print(
+                                f"Epoch {epoch}/{NUM_EPOCHS} | "
+                                f"Acc@0.5: {acc:.4f}, P@0.5: {precision:.4f}, "
+                                f"R@0.5: {recall:.4f}, F1@0.5: {f1:.4f}, "
+                                f"F1@best_t({used_threshold:.2f}): {f1_for_es:.4f}, "
+                                f"best F1: {best_f1:.4f} (epoch {best_epoch}){saved_flag} "
+                                f"wait={wait}/{patience}"
+                            )
 
-                    # ② Val の F1 / Recall / Precision
-                    plt.figure(figsize=(6,4))
-                    plt.plot(history["epoch"], history["val_f1"], label="Val F1")
-                    plt.plot(history["epoch"], history["val_rec"], label="Val Recall")
-                    plt.plot(history["epoch"], history["val_prec"], label="Val Precision")
-                    plt.xlabel("Epoch")
-                    plt.ylabel("Score")
-                    plt.ylim(0.0, 1.0)
-                    plt.legend()
-                    plt.grid(True)
-                    plt.tight_layout()
-                    plt.savefig(PLOT_DIR / f"training_metrics_bs{batch_size}_lr{lr_str}.png")
-                    plt.close()
+                            if wait >= patience:
+                                print(
+                                    f"[EarlyStopping] no F1 improvement for {patience} epochs. "
+                                    "Stop training."
+                                )
+                                break
+                        else:
+                            # val_loader が無い場合は毎エポック上書きで保存
+                            torch.save(model.state_dict(), str(SAVE_PATH))
 
-                    # ③ Val Accuracy
-                    plt.figure(figsize=(6,4))
-                    plt.plot(history["epoch"], history["val_acc"], label="Val Acc")
-                    plt.xlabel("Epoch")
-                    plt.ylabel("Accuracy")
-                    plt.ylim(0.0, 1.0)
-                    plt.grid(True)
-                    plt.tight_layout()
-                    plt.savefig(PLOT_DIR / f"training_acc_bs{batch_size}_lr{lr_str}.png")
-                    plt.close()
+                    # この (batch_size, lr, bert_ratio) の結果を記録
+                    all_results.append({
+                        "batch_size": batch_size,
+                        "lr": lr,
+                        "bert_lr_ratio": bert_ratio,
+                        "bert_lr": bert_lr,
+                        "best_f1": float(best_f1),
+                        "best_epoch": int(best_epoch),
+                        "model_path": str(SAVE_PATH),
+                    })
 
+                    # 簡単な学習曲線を保存 (組み合わせごとに別ファイル)
+                    if history["epoch"]:
+                        # ① Loss 曲線
+                        plt.figure(figsize=(6, 4))
+                        plt.plot(history["epoch"], history["train_loss"], label="Train Loss")
+                        plt.plot(history["epoch"], history["val_loss"], label="Val Loss")
+                        plt.xlabel("Epoch")
+                        plt.ylabel("Loss")
+                        plt.legend()
+                        plt.grid(True)
+                        plt.tight_layout()
+                        plt.savefig(
+                            PLOT_DIR / f"loss_curve_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
+                        )
+                        plt.close()
 
-        # 全体の結果を表示
+                        # ② Val の F1 / Recall / Precision
+                        plt.figure(figsize=(6, 4))
+                        plt.plot(history["epoch"], history["val_f1"], label="Val F1")
+                        plt.plot(history["epoch"], history["val_rec"], label="Val Recall")
+                        plt.plot(history["epoch"], history["val_prec"], label="Val Precision")
+                        plt.xlabel("Epoch")
+                        plt.ylabel("Score")
+                        plt.ylim(0.0, 1.0)
+                        plt.legend()
+                        plt.grid(True)
+                        plt.tight_layout()
+                        plt.savefig(
+                            PLOT_DIR / f"training_metrics_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
+                        )
+                        plt.close()
+
+                        # ③ Val Accuracy
+                        plt.figure(figsize=(6, 4))
+                        plt.plot(history["epoch"], history["val_acc"], label="Val Acc")
+                        plt.xlabel("Epoch")
+                        plt.ylabel("Accuracy")
+                        plt.ylim(0.0, 1.0)
+                        plt.grid(True)
+                        plt.tight_layout()
+                        plt.savefig(
+                            PLOT_DIR / f"training_acc_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
+                        )
+                        plt.close()
+
+        # 全体の結果を表示（batch × lr × bert_ratio 全部）
         print("\n===== SWEEP SUMMARY (sorted by best_f1) =====")
         for r in sorted(all_results, key=lambda x: x["best_f1"], reverse=True):
             print(
-                f"batch={r['batch_size']}, lr={r['lr']}, "
+                f"batch={r['batch_size']}, "
+                f"lr={r['lr']}, "
+                f"bert_ratio={r['bert_lr_ratio']}, "
+                f"bert_lr={r['bert_lr']}, "
                 f"best_f1={r['best_f1']:.4f} (epoch {r['best_epoch']}), "
                 f"model={r['model_path']}"
             )
