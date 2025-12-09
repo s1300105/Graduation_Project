@@ -856,12 +856,66 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        '--dataset',
+        choices=['bigvul', 'diversevul', 'six'],
+        default='six',
+        help='どのデータセットを使うか: bigvul / diversevul / six(new_six_by_projects)'
+    )
+
+    parser.add_argument(
         '--no_subset',
         action='store_true',
         help='サブセットを使わず、train 全体を 1 epoch で使う'
     )
 
+    parser.add_argument(
+        '--patience',
+        type=int,
+        default=5,
+        help='EarlyStoppingのpatience'
+    )
+
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=None,
+        help='単一のバッチサイズを指定（指定しない場合は [8,16,32] で sweep）'
+    )
+    parser.add_argument(
+        '--lr',
+        type=float,
+        default=None,
+        help='単一の学習率を指定（指定しない場合は [1e-4, 5e-5, 3e-5, 1e-5] で sweep）'
+    )
+    parser.add_argument(
+        '--bert_lr_ratio',
+        type=float,
+        default=None,
+        help='単一の bert_lr_ratio を指定（指定しない場合は [0.1, 0.2, 0.3] で sweep）'
+    )
+
     args = parser.parse_args()
+
+    if args.dataset == 'bigvul':
+        train_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/bigvul_defect_train.jsonl"
+        valid_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/bigvul_defect_valid.jsonl"
+        test_path  = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/bigvul_defect_test.jsonl"
+
+    elif args.dataset == 'diversevul':
+        train_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/diversevul_train.jsonl"
+        valid_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/diversevul_valid.jsonl"
+        test_path  = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/diversevul_test.jsonl"
+
+    elif args.dataset == 'six':
+        # もともとの new_six_by_projects
+        train_path = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/train.jsonl"
+        valid_path = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/valid.jsonl"
+        test_path  = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/test.jsonl"
+
+    print("[DATASET] use:", args.dataset)
+    print("  train:", train_path)
+    print("  valid:", valid_path)
+    print("  test :", test_path)
 
     if args.cpg:
         CPG_generator()
@@ -929,15 +983,31 @@ if __name__ == '__main__':
                 f"effective_samples_per_epoch={effective_samples}"
             )
 
-        # 探索するバッチサイズと学習率の候補
-        batch_candidates = [8, 16, 32]
-        lr_candidates = [1e-4, 5e-5, 3e-5, 1e-5]
+                # 探索するバッチサイズと学習率の候補
+        if args.batch_size is not None:
+            batch_candidates = [args.batch_size]
+            print(f"[HP] batch_size 指定あり → {batch_candidates}")
+        else:
+            batch_candidates = [8, 16, 32]
+            print(f"[HP] batch_size sweep → {batch_candidates}")
 
-        # ★ CodeBERT 用の lr 比率
-        bert_lr_ratios = [0.1, 0.2, 0.3]
+        if args.lr is not None:
+            lr_candidates = [args.lr]
+            print(f"[HP] lr 指定あり → {lr_candidates}")
+        else:
+            lr_candidates = [1e-4, 5e-5, 3e-5, 1e-5]
+            print(f"[HP] lr sweep → {lr_candidates}")
 
-        patience = 5
+        if args.bert_lr_ratio is not None:
+            bert_lr_ratios = [args.bert_lr_ratio]
+            print(f"[HP] bert_lr_ratio 指定あり → {bert_lr_ratios}")
+        else:
+            bert_lr_ratios = [0.1, 0.2, 0.3]
+            print(f"[HP] bert_lr_ratio sweep → {bert_lr_ratios}")
+
+        patience = max(1, args.patience)
         NUM_EPOCHS = context.epochs
+        print(f"[EarlyStopping] patience={patience}")
 
         all_results = []  # (batch, lr, bert_ratio, ...) を記録
 

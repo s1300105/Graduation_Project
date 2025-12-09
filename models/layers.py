@@ -1,5 +1,5 @@
 import os, sys, torch
-PROJECT_ROOT = "/home/yudai/Project/research/Vul_Detection"
+PROJECT_ROOT = "/home/yudai/Project/research/Graduation_Project"
 os.chdir(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
@@ -223,20 +223,30 @@ class GraphCodeFusion(nn.Module):
         ffn_hidden_dim: int = None,
         fusion_out_dim: int = 200,   # ここは最終的に出したい次元
         dropout: float = 0.1,
+        attn_layers: int = 3,
     ):
         super().__init__()
 
-        # 1) Projection 層
         self.proj_code = nn.Linear(code_dim, proj_dim)
         self.proj_graph = nn.Linear(graph_dim, proj_dim)
 
-        # 2) Cross-Attention (双方向)
-        self.attn_code = CrossAttentionBlock(proj_dim, num_heads=num_heads, dropout=dropout)
-        self.attn_graph = CrossAttentionBlock(proj_dim, num_heads=num_heads, dropout=dropout)
+        # 2) Cross-Attention を「attn_layers 層」分持つ
+        self.attn_code_layers = nn.ModuleList([
+            CrossAttentionBlock(proj_dim, num_heads=num_heads, dropout=dropout)
+            for _ in range(attn_layers)
+        ])
+        self.attn_graph_layers = nn.ModuleList([
+            CrossAttentionBlock(proj_dim, num_heads=num_heads, dropout=dropout)
+            for _ in range(attn_layers)
+        ])
 
-        # 3) Add & LayerNorm
-        self.norm_code = nn.LayerNorm(proj_dim)
-        self.norm_graph = nn.LayerNorm(proj_dim)
+        # 各層ごとの LayerNorm（Transformer 風）
+        self.norm_code_layers = nn.ModuleList([
+            nn.LayerNorm(proj_dim) for _ in range(attn_layers)
+        ])
+        self.norm_graph_layers = nn.ModuleList([
+            nn.LayerNorm(proj_dim) for _ in range(attn_layers)
+        ])
 
         # 4〜6) FFN → LayerNorm → Linear (concat後)
         fused_dim = proj_dim * 2  # code + graph
@@ -258,26 +268,37 @@ class GraphCodeFusion(nn.Module):
         mask    : [B, L] (1=有効ノード, 0=パディング) or None
         return  : fused_repr [B, fusion_out_dim]  # グラフごとのベクトル
         """
-        # 1) Projection
-        code_h  = self.proj_code(code_emb)     # [B, Lc, D]
-        graph_h = self.proj_graph(graph_emb)   # [B, Lg, D]
 
-        # 2) Cross-Attention
-        code_ca = self.attn_code(
-            query=code_h,
-            key=graph_h,
-            value=graph_h,
-        )  # [B, Lc, D]
+        code_h = self.proj_code(code_emb)
+        graph_h = self.proj_graph(graph_emb)
 
-        graph_ca = self.attn_graph(
-            query=graph_h,
-            key=code_h,
-            value=code_h,
-        )  # [B, Lg, D]
+            # 2) Cross-Attention を attn_layers 回繰り返す
+        for attn_code, attn_graph, norm_c, norm_g in zip(
+            self.attn_code_layers,
+            self.attn_graph_layers,
+            self.norm_code_layers,
+            self.norm_graph_layers,
+        ):
+            # code が query → graph を見る Cross-Attn
+            code_ca = attn_code(
+                query=code_h,
+                key=graph_h,
+                value=graph_h,
+            )  # [B, Lc, D]
 
-        # 3) Add & LayerNorm
-        code_out  = self.norm_code(code_h + code_ca)      # [B, Lc, D]
-        graph_out = self.norm_graph(graph_h + graph_ca)   # [B, Lg, D]
+            # graph が query → code を見る Cross-Attn
+            graph_ca = attn_graph(
+                query=graph_h,
+                key=code_h,
+                value=code_h,
+            )  # [B, Lg, D]
+
+            # 残差接続 + LayerNorm（層ごとに別の Norm）
+            code_h  = norm_c(code_h  + code_ca)    # [B, Lc, D]
+            graph_h = norm_g(graph_h + graph_ca)   # [B, Lg, D]
+
+        # 最終層の出力を out として扱う
+        code_out, graph_out = code_h, graph_h
 
         # 4) プーリング（mask があれば “有効ノードだけ”）
         if code_mask is not None:

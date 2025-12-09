@@ -147,9 +147,15 @@ class BertRGCN(nn.Module):
             ffn_hidden_dim=hidden_dim * 4,
             fusion_out_dim=hidden_dim,
             dropout=0.1,
+            attn_layers=1,
         )
 
-        self.classifier = nn.Linear(hidden_dim, 2)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 2)
+        )
 
 
     def forward(self, data):
