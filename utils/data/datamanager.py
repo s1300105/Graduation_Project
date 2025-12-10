@@ -76,8 +76,8 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 def drop(data_frame: pd.DataFrame, keys):
-    for key in keys:
-        del data_frame[key]
+    data_frame.drop(columns=[k for k in keys if k in data_frame.columns], inplace=True)
+
 
 def slice_frame(data_frame: pd.DataFrame, size:int):
     data_frame_size = len(data_frame)

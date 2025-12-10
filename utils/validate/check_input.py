@@ -4,7 +4,7 @@ import json
 from torch_geometric.data import Data
 from pathlib import Path
 
-in_dir = Path("/home/yudai/Project/research/Vul_Detection/data/input")
+in_dir = Path("/home/yudai/Project/research/Graduation_Project/data/input")
 files = sorted(in_dir.glob("*_cpg_input.pkl"))
 
 # ----- ① pkl読み込み -----
