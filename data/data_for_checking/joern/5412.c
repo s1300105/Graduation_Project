@@ -1,0 +1,1 @@
+  void append(char const*, size_t) {}

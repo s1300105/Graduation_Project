@@ -53,6 +53,26 @@ test_path  = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_b
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
+class FocalLoss(torch.nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        # alphaはクラス重み (Tensor)。指定がなければNone
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        # inputs: [B, C], targets: [B]
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)  # pt = p (正解クラスの確率)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 class BalancedStreamDataset(IterableDataset):
@@ -341,21 +361,37 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
     model.train()
     total_loss = 0.0
     n_batches = 0
+    
+    # ★ 追加: 重み集計用
+    total_w_code = 0.0
+    total_w_graph = 0.0
 
     for batch_idx, batch in enumerate(train_loader):
         try:
             batch = batch.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            y_pred = model(batch)          # [B, 2]
+            y_pred = model(batch)
             batch.y = batch.y.view(-1).long()
             loss = criterion(y_pred, batch.y)
             loss.backward()
 
-            # ロス集計
             total_loss += loss.item()
             n_batches += 1
 
+            # ★ 追加: 重みの取得 (LMGNN.pyの修正が前提)
+            
+
+            # ★ 修正: fusion属性がある場合のみ重みを取得
+            if hasattr(model, "fusion") and hasattr(model.fusion, "last_weights"):
+                total_w_code += model.fusion.last_weights["code"]
+                total_w_graph += model.fusion.last_weights["graph"]
+            else:
+                # CodeBERTOnlyの場合などは重みがないので適当な値あるいは0を入れる
+                total_w_code += 0.0
+                total_w_graph += 0.0
+
+            # ログ表示 (必要に応じて)
             if (batch_idx+1) % 200 == 0:
                 _diag_logits("train", y_pred, batch.y)
 
@@ -363,21 +399,24 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
             if scheduler is not None:
                 scheduler.step()
 
-            #if (batch_idx + 1) % 100 == 0:
-            #    num_graphs = getattr(batch, "num_graphs", 1)
-            #    print(f'Train Epoch: {epoch} step {batch_idx+1} (+{num_graphs} graphs)\tLoss: {loss.item():.6f}')
         except RuntimeError as e:
-            # まれな CUDA OOM をスキップして進行
             if "out of memory" in str(e).lower():
-                print(f"[WARN] CUDA OOM at step {batch_idx+1}. Skipping this batch.")
+                print(f"[WARN] CUDA OOM at step {batch_idx+1}. Skipping.")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
             raise
 
     avg_loss = total_loss / max(1, n_batches)
-    print(f"[Train] Epoch {epoch} avg_loss={avg_loss:.6f}")
-    return avg_loss
+    
+    # ★ 追加: 平均重みの計算
+    avg_w_code = total_w_code / max(1, n_batches)
+    avg_w_graph = total_w_graph / max(1, n_batches)
+
+    print(f"[Train] Epoch {epoch} avg_loss={avg_loss:.6f}, w_code={avg_w_code:.3f}, w_graph={avg_w_graph:.3f}")
+    
+    # ★ 変更: loss と一緒に重みも返す
+    return avg_loss, avg_w_code, avg_w_graph
 
 
 
@@ -743,18 +782,30 @@ def make_stream_loader_for_split(
     )
 
 
-def _resolve_save_path(user_path: str | None, default_dir: str = "./saved_models", filename: str = "bert_rgcn.pth") -> Path:
+def _resolve_save_path(user_path: str | None,
+                       default_dir: str = "./saved_models",
+                       filename: str = "bert_rgcn.pth") -> Path:
     if not user_path or user_path.strip() == "":
         save_dir = Path(default_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         return save_dir / filename
+
     p = Path(user_path)
+
+    # もし user_path が既に存在していてディレクトリなら、その中に filename を作る
+    if p.exists() and p.is_dir():
+        (p).mkdir(parents=True, exist_ok=True)
+        return p / filename
+
+    # 拡張子が無い → ディレクトリ扱いにして、その下に filename を作る
     if p.suffix == "":
         p.mkdir(parents=True, exist_ok=True)
         return p / filename
-    else:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
+
+    # それ以外（.pth とか）は「ファイル」とみなす
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
     
 
 def _split_file_paths(split: str):
@@ -857,9 +908,9 @@ if __name__ == '__main__':
 
     parser.add_argument(
         '--dataset',
-        choices=['bigvul', 'diversevul', 'six'],
+        choices=['bigvul', 'diversevul', 'six', 'primevul'],
         default='six',
-        help='どのデータセットを使うか: bigvul / diversevul / six(new_six_by_projects)'
+        help='どのデータセットを使うか: bigvul / diversevul / six(new_six_by_projects) / primevul'
     )
 
     parser.add_argument(
@@ -894,6 +945,13 @@ if __name__ == '__main__':
         help='単一の bert_lr_ratio を指定（指定しない場合は [0.1, 0.2, 0.3] で sweep）'
     )
 
+    parser.add_argument(
+        '--model_type',
+        choices=['hybrid', 'codebert'],
+        default='hybrid',
+        help='モデルの種類を選択： hybrid　（CodeBERT+R-GCN）または　CodeBERT（CodeBERTのみ）'
+    )
+
     args = parser.parse_args()
 
     if args.dataset == 'bigvul':
@@ -911,6 +969,11 @@ if __name__ == '__main__':
         train_path = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/train.jsonl"
         valid_path = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/valid.jsonl"
         test_path  = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_by_projects/test.jsonl"
+
+    elif args.dataset == 'primevul':
+        train_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/primevul_defect_train.jsonl"
+        valid_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/primevul_defect_train.jsonl"
+        test_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/primevul_defect_train.jsonl"
 
     print("[DATASET] use:", args.dataset)
     print("  train:", train_path)
@@ -961,7 +1024,9 @@ if __name__ == '__main__':
             )
             class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
 
-        criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+        #criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+        criterion = FocalLoss(alpha=class_weights, gamma=2.0).to(device)
+        print("Using Focal Loss with gamma=2.0")
         print("Class weights:", class_weights)
 
         # ★★ ここから：HPチューニング用のサブセットサイズを決定 ★★
@@ -1044,10 +1109,20 @@ if __name__ == '__main__':
                     print("-" * 60)
 
                     # モデルを新規に構築（毎回リセット）
-                    model = BertRGCN(
-                        gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv
-                    ).to(device)
+                    # 必要なクラスをインポート
+                    from models.LMGNN import BertRGCN, CodeBERTOnly
 
+                    # ... (中略) ...
+
+                    # モデル初期化ロジック (trainループ内およびtestモード内)
+                    if args.model_type == 'codebert':
+                        print("[MODEL] Using CodeBERT Only baseline.")
+                        model = CodeBERTOnly(device).to(device)
+                    else:
+                        print("[MODEL] Using Hybrid (BertRGCN) model.")
+                        model = BertRGCN(
+                            gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv
+                        ).to(device)
                     # --- Optimizer: CodeBERT とそれ以外で lr を分ける ---
                     wd = 5e-4
                     base_lr = lr
@@ -1107,6 +1182,8 @@ if __name__ == '__main__':
                         "val_prec": [],
                         "val_rec": [],
                         "val_f1": [],
+                        "avg_w_code": [],
+                        "avg_w_graph": [],
                     }
 
                     SAVE_PATH = _resolve_save_path(
@@ -1120,7 +1197,7 @@ if __name__ == '__main__':
 
                     for epoch in range(1, NUM_EPOCHS + 1):
                         # --- 学習 ---
-                        train_loss = train(
+                        train_loss, w_c, w_g = train(
                             model, train_loader, optimizer, epoch, criterion, scheduler=scheduler
                         )
 
@@ -1137,6 +1214,8 @@ if __name__ == '__main__':
                             history["val_prec"].append(precision)
                             history["val_rec"].append(recall)
                             history["val_f1"].append(f1)
+                            history["avg_w_code"].append(w_c)
+                            history["avg_w_graph"].append(w_g)
 
                             # ② Validation 上で「F1が最大になるしきい値」を探索
                             best_t, best_stats = search_best_threshold(
@@ -1239,6 +1318,27 @@ if __name__ == '__main__':
                         )
                         plt.close()
 
+                        plt.figure(figsize=(6, 4))
+                        plt.plot(history["epoch"], history["avg_w_code"], label="Weight: CodeBERT", marker="o")
+                        plt.plot(history["epoch"], history["avg_w_graph"], label="Weight: R-GCN", marker="x")
+                        plt.xlabel("Epoch")
+                        plt.ylabel("Gate Weight (avg)")
+                        plt.ylim(0.0, 1.0) # Softmaxなので0-1に収まるはず
+                        plt.legend()
+                        plt.grid(True)
+                        plt.title(f"Modality Weights (bs={batch_size}, lr={lr_str})")
+                        plt.tight_layout()
+                        
+                        # ファイル保存
+                        plot_filename = f"weights_curve_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
+                        plt.savefig(PLOT_DIR / plot_filename)
+                        plt.close()
+                        
+                        print(f"[Plot] Saved weights plot to {PLOT_DIR / plot_filename}")
+
+
+
+
         # 全体の結果を表示（batch × lr × bert_ratio 全部）
         print("\n===== SWEEP SUMMARY (sorted by best_f1) =====")
         for r in sorted(all_results, key=lambda x: x["best_f1"], reverse=True):
@@ -1274,7 +1374,13 @@ if __name__ == '__main__':
         # SAVE_PATH は単一モデルを指す（従来通り）
         SAVE_PATH = _resolve_save_path(args.path, filename="bert_rgcn.pth")
 
-        model_test = BertRGCN(gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv).to(device)
+        if args.model_type == 'codebert':
+            from models.LMGNN import CodeBERTOnly
+            model_test = CodeBERTOnly(device).to(device)
+        else:
+            model_test = BertRGCN(gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv).to(device)
+
+        # 以降は共通
         model_test.load_state_dict(torch.load(str(SAVE_PATH), map_location=device))
 
         # ① 固定しきい値 0.5

@@ -9,8 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import RGCNConv
 
-
-
 torch.manual_seed(2020)
 
 
@@ -28,7 +26,6 @@ def get_conv_mp_out_size(in_size, last_layer, mps):
 def encode_input(text, tokenizer):
     max_length = 512
     input = tokenizer(text, max_length=max_length, truncation=True, padding='max_length', return_tensors='pt')
-#     print(input.keys())
     return input.input_ids, input.attention_mask
 
 
@@ -38,7 +35,6 @@ def init_weights(m):
 
 
 class Conv(nn.Module):
-
     def __init__(self, conv1d_1, conv1d_2, maxpool1d_1, maxpool1d_2, fc_1_size, fc_2_size):
         super(Conv, self).__init__()
         self.conv1d_1_args = conv1d_1
@@ -67,7 +63,6 @@ class Conv(nn.Module):
         self.fc1 = nn.Linear(Z_flatten_size, 1)
         self.fc2 = nn.Linear(Y_flatten_size, 1)
 
-
     def forward(self, hidden, x):
         concat = torch.cat([hidden, x], 1)
         concat_size = hidden.shape[1] + x.shape[1]
@@ -88,14 +83,11 @@ class Conv(nn.Module):
         Y = Y.view(-1, Y_flatten_size)
         res = self.fc1(Z) * self.fc2(Y)
         res = self.drop(res)
-        # res = res.mean(1)
-        # print(res, mean)
         sig = torch.sigmoid(torch.flatten(res))
         return sig
 
 
 class Net(nn.Module):
-
     def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None):
         super().__init__()
         self.device = device
@@ -146,7 +138,6 @@ class Net(nn.Module):
         self.load_state_dict(torch.load(path, map_location=self.device))
 
 
-
 class PositionwiseFFN(nn.Module):
     def __init__(self, dim, hidden_dim=None, dropout=0.1):
         super().__init__()
@@ -164,11 +155,9 @@ class PositionwiseFFN(nn.Module):
         return self.net(x)
 
 
-class CrossAttentionBlock(nn.Module):
+class AttentionBlock(nn.Module):
     """
-    純粋な Cross-Attention だけを行うブロック。
-    - FFN / LayerNorm / 残差接続は一切入れない。
-    - それらは LMGNN.py 側で組み合わせて使う想定。
+    汎用的な Attention ブロック (Self / Cross 兼用)。
     """
     def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -184,13 +173,12 @@ class CrossAttentionBlock(nn.Module):
         query: torch.Tensor,      # [B, L_q, D]
         key: torch.Tensor,        # [B, L_k, D]
         value: torch.Tensor,      # [B, L_k, D]
-        key_padding_mask=None,    # [B, L_k] (任意)
+        key_padding_mask=None,    # [B, L_k]
         need_weights: bool = False,
     ):
         """
         戻り値:
             out: [B, L_q, D]
-            attn_weights: [B, num_heads, L_q, L_k]（need_weights=True のとき）
         """
         out, attn_weights = self.attn(
             query=query,
@@ -202,17 +190,70 @@ class CrossAttentionBlock(nn.Module):
         return out
 
 
+class FusionBlock(nn.Module):
+    """
+    1層分の融合レイヤー:
+    1. Self-Attention (Code & Graph)
+    2. Cross-Attention (Code <-> Graph)
+    3. FFN (Feed Forward Network) ★追加
+    """
+    def __init__(self, dim, num_heads, ffn_dim, dropout):
+        super().__init__()
+        # --- 1. Self-Attention ---
+        #self.self_attn_code = AttentionBlock(dim, num_heads, dropout)
+        #self.norm1_code = nn.LayerNorm(dim)
+        
+        #self.self_attn_graph = AttentionBlock(dim, num_heads, dropout)
+        #self.norm1_graph = nn.LayerNorm(dim)
+
+        # --- 2. Cross-Attention ---
+        self.cross_attn_code = AttentionBlock(dim, num_heads, dropout)
+        self.norm2_code = nn.LayerNorm(dim)
+
+        self.cross_attn_graph = AttentionBlock(dim, num_heads, dropout)
+        self.norm2_graph = nn.LayerNorm(dim)
+
+        # --- 3. Position-wise FFN (各層に追加) ---
+        self.ffn_code = PositionwiseFFN(dim, ffn_dim, dropout)
+        self.norm3_code = nn.LayerNorm(dim)
+
+        self.ffn_graph = PositionwiseFFN(dim, ffn_dim, dropout)
+        self.norm3_graph = nn.LayerNorm(dim)
+
+    def forward(self, code, graph, code_padding_mask, graph_padding_mask):
+        # --- 1. Self-Attention ---
+        # Code
+        #c2 = self.self_attn_code(query=code, key=code, value=code, key_padding_mask=code_padding_mask)
+        #code = self.norm1_code(code + c2)
+        # Graph
+        #g2 = self.self_attn_graph(query=graph, key=graph, value=graph, key_padding_mask=graph_padding_mask)
+        #graph = self.norm1_graph(graph + g2)
+
+        # --- 2. Cross-Attention ---
+        # Code query, Graph key/value (CodeがGraphの情報を取り込む)
+        c_cross = self.cross_attn_code(query=code, key=graph, value=graph, key_padding_mask=graph_padding_mask)
+        code_next = self.norm2_code(code + c_cross)
+
+        # Graph query, Code key/value (GraphがCodeの情報を取り込む)
+        g_cross = self.cross_attn_graph(query=graph, key=code, value=code, key_padding_mask=code_padding_mask)
+        graph_next = self.norm2_graph(graph + g_cross)
+        
+        code, graph = code_next, graph_next
+
+        # --- 3. FFN ---
+        code = self.norm3_code(code + self.ffn_code(code))
+        graph = self.norm3_graph(graph + self.ffn_graph(graph))
+
+        return code, graph
+
 
 class GraphCodeFusion(nn.Module):
     """
-    CodeBERT埋め込みとR-GCN埋め込みをCross-Attentionで融合するブロック。
-
-    手順:
-      1. code, graph それぞれ projection
-      2. 双方向 cross-attention
-      3. Add & LayerNorm (各側)
-      4. pooling → concat
-      5. FFN → LayerNorm → Linear
+    CodeBERT埋め込みとR-GCN埋め込みを融合するブロック。
+    Standard Transformer Fusion:
+      1. Self-Attention (Code & Graph independent)
+      2. Cross-Attention (Code<->Graph interaction)
+      3. FFN (per layer)
     """
     def __init__(
         self,
@@ -221,106 +262,104 @@ class GraphCodeFusion(nn.Module):
         proj_dim: int = 200,
         num_heads: int = 4,
         ffn_hidden_dim: int = None,
-        fusion_out_dim: int = 200,   # ここは最終的に出したい次元
+        fusion_out_dim: int = 200,
         dropout: float = 0.1,
-        attn_layers: int = 3,
+        attn_layers: int = 1,
     ):
         super().__init__()
+
+        # FFNの隠れ層次元（指定がなければ投影次元の4倍が標準的）
+        if ffn_hidden_dim is None:
+            ffn_hidden_dim = proj_dim * 4
 
         self.proj_code = nn.Linear(code_dim, proj_dim)
         self.proj_graph = nn.Linear(graph_dim, proj_dim)
 
-        # 2) Cross-Attention を「attn_layers 層」分持つ
-        self.attn_code_layers = nn.ModuleList([
-            CrossAttentionBlock(proj_dim, num_heads=num_heads, dropout=dropout)
+        # ループ構造を FusionBlock に委譲
+        self.layers = nn.ModuleList([
+            FusionBlock(proj_dim, num_heads, ffn_hidden_dim, dropout)
             for _ in range(attn_layers)
         ])
-        self.attn_graph_layers = nn.ModuleList([
-            CrossAttentionBlock(proj_dim, num_heads=num_heads, dropout=dropout)
-            for _ in range(attn_layers)
-        ])
+        
+        self.gate_layer = nn.Linear(proj_dim * 2, 2)
 
-        # 各層ごとの LayerNorm（Transformer 風）
-        self.norm_code_layers = nn.ModuleList([
-            nn.LayerNorm(proj_dim) for _ in range(attn_layers)
-        ])
-        self.norm_graph_layers = nn.ModuleList([
-            nn.LayerNorm(proj_dim) for _ in range(attn_layers)
-        ])
-
-        # 4〜6) FFN → LayerNorm → Linear (concat後)
-        fused_dim = proj_dim * 2  # code + graph
-        self.ffn = PositionwiseFFN(fused_dim, hidden_dim=ffn_hidden_dim, dropout=dropout)
-        self.norm_fused = nn.LayerNorm(fused_dim)
+        # Final Fusion Output
+        fused_dim = proj_dim * 2
+        self.ffn_final = PositionwiseFFN(fused_dim, hidden_dim=ffn_hidden_dim, dropout=dropout)
+        self.norm_final = nn.LayerNorm(fused_dim)
         self.linear_out = nn.Linear(fused_dim, fusion_out_dim)
 
     def forward(
         self,
-        code_emb: torch.Tensor,            # [B, L_code, code_dim]
-        graph_emb: torch.Tensor,           # [B, L_graph, graph_dim]
-        code_mask: torch.Tensor | None = None,   # [B, L_code]
-        graph_mask: torch.Tensor | None = None,  # [B, L_graph]
+        code_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        code_mask: torch.Tensor | None = None,   # [B, L_code] (1=有効, 0=Padding)
+        graph_mask: torch.Tensor | None = None,  # [B, L_graph] (1=有効, 0=Padding)
     ):
-
-        """
-        code_emb:  [B, L_code, code_dim]
-        graph_emb:[B, L_graph, graph_dim]
-        mask    : [B, L] (1=有効ノード, 0=パディング) or None
-        return  : fused_repr [B, fusion_out_dim]  # グラフごとのベクトル
-        """
-
         code_h = self.proj_code(code_emb)
         graph_h = self.proj_graph(graph_emb)
 
-            # 2) Cross-Attention を attn_layers 回繰り返す
-        for attn_code, attn_graph, norm_c, norm_g in zip(
-            self.attn_code_layers,
-            self.attn_graph_layers,
-            self.norm_code_layers,
-            self.norm_graph_layers,
-        ):
-            # code が query → graph を見る Cross-Attn
-            code_ca = attn_code(
-                query=code_h,
-                key=graph_h,
-                value=graph_h,
-            )  # [B, Lc, D]
+        # マスクの準備 (PyTorch MultiheadAttentionは True=無視 なので反転させる)
+        code_padding_mask = (code_mask == 0) if code_mask is not None else None
+        graph_padding_mask = (graph_mask == 0) if graph_mask is not None else None
 
-            # graph が query → code を見る Cross-Attn
-            graph_ca = attn_graph(
-                query=graph_h,
-                key=code_h,
-                value=code_h,
-            )  # [B, Lg, D]
+        # --- Attention Layers Loop ---
+        for layer in self.layers:
+            code_h, graph_h = layer(
+                code_h, graph_h,
+                code_padding_mask, graph_padding_mask
+            )
 
-            # 残差接続 + LayerNorm（層ごとに別の Norm）
-            code_h  = norm_c(code_h  + code_ca)    # [B, Lc, D]
-            graph_h = norm_g(graph_h + graph_ca)   # [B, Lg, D]
-
-        # 最終層の出力を out として扱う
-        code_out, graph_out = code_h, graph_h
-
-        # 4) プーリング（mask があれば “有効ノードだけ”）
+        # --- Pooling & Output ---
+        
+        # Code側: Masked Mean Pooling (旧 Max Pooling から変更)
         if code_mask is not None:
-            code_mask_f = code_mask.float().unsqueeze(-1)        # [B, Lc, 1]
-            code_sum  = (code_out * code_mask_f).sum(dim=1)      # [B, D]
-            denom_c   = code_mask_f.sum(dim=1).clamp(min=1e-6)   # [B, 1]
-            code_vec  = code_sum / denom_c                       # [B, D]
+            # mask: [B, L], code_h: [B, L, D]
+            mask_f = code_mask.float().unsqueeze(-1)  # [B, L, 1]
+            code_sum = (code_h * mask_f).sum(dim=1)   # [B, D]
+            denom_c = mask_f.sum(dim=1).clamp(min=1e-6)
+            code_vec = code_sum / denom_c
         else:
-            code_vec  = code_out.mean(dim=1)                     # [B, D]
+            code_vec = code_h.mean(dim=1)
 
+        # Graph側: Mean Pooling (変更なし)
         if graph_mask is not None:
-            graph_mask_f = graph_mask.float().unsqueeze(-1)      # [B, Lg, 1]
-            graph_sum  = (graph_out * graph_mask_f).sum(dim=1)   # [B, D]
-            denom_g   = graph_mask_f.sum(dim=1).clamp(min=1e-6)  # [B, 1]
-            graph_vec = graph_sum / denom_g                      # [B, D]
+            graph_mask_f = graph_mask.float().unsqueeze(-1)
+            graph_sum = (graph_h * graph_mask_f).sum(dim=1)
+            denom_g = graph_mask_f.sum(dim=1).clamp(min=1e-6)
+            graph_vec = graph_sum / denom_g
         else:
-            graph_vec = graph_out.mean(dim=1)
+            graph_vec = graph_h.mean(dim=1)
 
-        # 5) concat → FFN → LayerNorm → Linear
-        fused = torch.cat([code_vec, graph_vec], dim=-1)  # [B, 2D]
-        fused = self.ffn(fused)                           # [B, 2D]
-        fused = self.norm_fused(fused)                    # [B, 2D]
-        fused = self.linear_out(fused)                    # [B, fusion_out_dim]
+
+
+        # 1. まず両方の情報を一度結合して「状況」を把握する
+        combined_features = torch.cat([code_vec, graph_vec], dim=-1)  # [B, 2*D]
+        
+        # 2. ゲート係数（重み）を計算する
+        # Softmaxを使うことで、w_code + w_graph = 1.0 になり、バランス調整という意味合いが強まる
+        gate_logits = self.gate_layer(combined_features)      # [B, 2]
+        gate_weights = F.softmax(gate_logits, dim=-1)         # [B, 2] (確率分布化)
+
+        w_code  = gate_weights[:, 0:1] # [B, 1]
+        w_graph = gate_weights[:, 1:2] # [B, 1]
+
+        # ★ ここで値を保存する (CPUに移してitem化し、計算グラフを切る)
+        if self.training:
+            # 訓練中のみ保存（推論時は無駄な処理を省くため）
+            self.last_weights = {
+                "code": w_code.mean().item(),
+                "graph": w_graph.mean().item()
+            }
+
+        # 3. 重み付き結合
+        fused = torch.cat([w_code * code_vec, w_graph * graph_vec], dim=-1)
+
+        # === 変更終了 ===
+
+        # 出力層へ
+        fused = self.ffn_final(fused)
+        fused = self.norm_final(fused)
+        fused = self.linear_out(fused)
 
         return fused

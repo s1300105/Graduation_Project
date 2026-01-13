@@ -131,6 +131,8 @@ class BertRGCN(nn.Module):
             for _ in range(num_layers)
         ])
 
+        self.rgcn_norm = nn.LayerNorm(hidden_dim)
+
         # ★ 用途② CodeBERT（トークン列用）
         self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
         self.func_encoder   = CodeBERTEncoder(
@@ -147,7 +149,7 @@ class BertRGCN(nn.Module):
             ffn_hidden_dim=hidden_dim * 4,
             fusion_out_dim=hidden_dim,
             dropout=0.1,
-            attn_layers=1,
+            attn_layers=3,
         )
 
         self.classifier = nn.Sequential(
@@ -181,6 +183,8 @@ class BertRGCN(nn.Module):
         for conv in self.rgcn_layers:
             h = F.relu(conv(h, edge_index, edge_type))
 
+        h = self.rgcn_norm(h)
+
         
 
         graph_dense, graph_mask = to_dense_batch(h, batch_idx)
@@ -202,7 +206,7 @@ class BertRGCN(nn.Module):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=256,  # 必要に応じて調整
+                max_length=512,  # 必要に応じて調整
             )
             input_ids     = enc["input_ids"].to(self.device)
             attention_mask = enc["attention_mask"].to(self.device)  # [B, L_code]
@@ -226,6 +230,69 @@ class BertRGCN(nn.Module):
         # 4) 分類
         logits = self.classifier(graph_repr)
         return logits
+    
+
+# models/LMGNN.py に追加
+
+class CodeBERTOnly(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+        
+        # CodeBERTエンコーダ (既存と同じ設定)
+        self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+        self.func_encoder = CodeBERTEncoder(
+            model_name="microsoft/codebert-base",
+            tune_last_n_layers=2,
+        )
+        
+        # CodeBERTの隠れ層サイズ (通常768)
+        self.bert_hidden_size = self.func_encoder.hidden_size
+
+        # 分類器
+        # 元のBertRGCNのclassifier構造に似せていますが、入力次元をCodeBERTに合わせます
+        self.classifier = nn.Sequential(
+            nn.Linear(self.bert_hidden_size, 200), # 一度次元を落とす（元のhidden_dimに合わせる場合）
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(200, 2)
+        )
+
+    def forward(self, data):
+        # 1) 関数コードのトークナイズ
+        funcs = getattr(data, "func", None)
+        if funcs is None:
+            # 万が一funcがない場合のダミー (Batchサイズに合わせてゼロ埋め)
+            # data.x からバッチサイズを推定
+            B = data.x.size(0) if hasattr(data, "x") else 1
+            return torch.zeros(B, 2, device=self.device)
+
+        if isinstance(funcs, str):
+            funcs = [funcs]
+
+        enc = self.func_tokenizer(
+            list(funcs),
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512, 
+        )
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+
+        # 2) CodeBERTでエンコード (return_cls=True で [CLS] トークンのみ取得)
+        # [B, 768]
+        cls_emb = self.func_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_cls=True 
+        )
+
+        # 3) 分類
+        logits = self.classifier(cls_emb)
+        return logits
+
+
 
 
 
