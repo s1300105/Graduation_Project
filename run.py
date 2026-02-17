@@ -12,9 +12,8 @@ from torch.utils.data import WeightedRandomSampler
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import seaborn as sns
 
-# ★ PyG の DataLoader を使う
-from torch_geometric.loader import DataLoader as GeoDataLoader
 
 import configs
 import utils.data as data
@@ -38,6 +37,10 @@ from torch_geometric.loader import DataLoader as GeoDataLoader
 from collections import deque
 import numpy as np
 from transformers import get_linear_schedule_with_warmup
+import wandb
+from pyvis.network import Network
+from torch_geometric.utils import to_networkx
+
 
 PLOT_DIR = Path("./plots")
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -158,7 +161,34 @@ def shuffle_df(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
     return df.sample(frac=1, random_state=seed).reset_index(drop=True)
 
 
+def generate_interactive_graph(pyg_data):
+    """PyGデータをW&B用のインタラクティブHTMLに変換"""
+    try:
+        # NetworkXへ変換 (有向グラフ)
+        G = to_networkx(pyg_data, to_undirected=False)
+        
+        # PyVisネットワーク作成
+        net = Network(height="500px", width="100%", bgcolor="#222222", font_color="white", directed=True)
+        net.from_nx(G)
+        
+        # 物理演算の設定 (見やすくするため少し調整)
+        net.toggle_physics(True)
+        
+        # HTML文字列を取得
+        # generate_html() が直接文字列を返さないバージョンのためのフォールバック
+        try:
+            html_string = net.generate_html()
+        except:
+            tmp_path = "temp_graph.html"
+            net.save_graph(tmp_path)
+            with open(tmp_path, "r") as f:
+                html_string = f.read()
+            if os.path.exists(tmp_path): os.remove(tmp_path)
 
+        return wandb.Html(html_string, inject=False)
+    except Exception as e:
+        print(f"[VizError] {e}")
+        return None
 
 # ------------------------------------------------------------
 # 公式 split ごとの CPG 生成（.bin -> graph JSON -> join -> pkl）
@@ -376,7 +406,8 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
             loss = criterion(y_pred, batch.y)
             loss.backward()
 
-            total_loss += loss.item()
+            loss_val = loss.item()
+            total_loss += loss_val
             n_batches += 1
 
             # ★ 追加: 重みの取得 (LMGNN.pyの修正が前提)
@@ -384,8 +415,10 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
 
             # ★ 修正: fusion属性がある場合のみ重みを取得
             if hasattr(model, "fusion") and hasattr(model.fusion, "last_weights"):
-                total_w_code += model.fusion.last_weights["code"]
-                total_w_graph += model.fusion.last_weights["graph"]
+                w_c = model.fusion.last_weights["code"]
+                w_g = model.fusion.last_weights["graph"]
+                total_w_code += w_c
+                total_w_graph += w_g
             else:
                 # CodeBERTOnlyの場合などは重みがないので適当な値あるいは0を入れる
                 total_w_code += 0.0
@@ -394,6 +427,13 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
             # ログ表示 (必要に応じて)
             if (batch_idx+1) % 200 == 0:
                 _diag_logits("train", y_pred, batch.y)
+            
+            wandb.log({
+                "Train/StepLoss": loss_val,
+                "Train/LR": optimizer.param_groups[0]['lr'],
+                "Weights/Code": w_c,
+                "Weights/Graph": w_g
+            })
 
             optimizer.step()
             if scheduler is not None:
@@ -415,6 +455,13 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
 
     print(f"[Train] Epoch {epoch} avg_loss={avg_loss:.6f}, w_code={avg_w_code:.3f}, w_graph={avg_w_graph:.3f}")
     
+    wandb.log({
+        "Train/EpochLoss": avg_loss,
+        "Train/AvgWeightCode": avg_w_code,
+        "Train/AvgWeightGraph": avg_w_graph,
+        "Epoch": epoch
+    })
+
     # ★ 変更: loss と一緒に重みも返す
     return avg_loss, avg_w_code, avg_w_graph
 
@@ -429,6 +476,19 @@ def validate(model, val_loader, plot_prefix: str = "val"):
     total_loss = 0.0
     n_batches = 0
     y_true, y_pred_labels = [], []
+    mistake_table_data = []
+    attn_weights_buffer = []
+
+
+    def hook_fn(module, input, output):
+        # output[1] が Attention Weights [Batch, Target, Source]
+        if len(output) == 2 and output[1] is not None:
+            attn_weights_buffer.append(output[1].detach().cpu())
+
+
+    handle = None
+    if hasattr(model, "context_attn"):
+        handle = model.context_attn.register_forward_hook(hook_fn)
 
     # ★ ロジット診断の状態を初期化
     diag_state = _diag_logits_init()
@@ -443,13 +503,82 @@ def validate(model, val_loader, plot_prefix: str = "val"):
             total_loss += loss.item()
             n_batches += 1
 
-            # 予測ラベル収集
+            probs = F.softmax(logits, dim=-1)
             pred = logits.argmax(dim=-1)
+
+            y_true_batch = batch.y.cpu().tolist()
+            y_pred_batch = pred.cpu().tolist()
+
             y_true.extend(batch.y.cpu().tolist())
             y_pred_labels.extend(pred.cpu().tolist())
 
             # ★ ロジット診断を逐次更新
             _diag_logits_update(diag_state, logits, batch.y)
+
+            y_true.extend(y_true_batch)
+            y_pred_labels.extend(y_pred_batch)
+            
+            # --- ★ 可視化: 最初のバッチのみ & 特定エポックのみ ---
+            if batch_idx == 0:
+                # 1. グラフ構造 (PyVis)
+                if hasattr(batch, "to_data_list"):
+                    sample_graph = batch.to_data_list()[0]
+                    html_graph = generate_interactive_graph(sample_graph)
+                    if html_graph:
+                        wandb.log({"InputGraph/Interactive": html_graph, "Epoch": epoch})
+                
+                # 2. Attention Map
+                if len(attn_weights_buffer) > 0:
+                    weights = attn_weights_buffer[0][0] # [Nodes, Tokens]
+                    
+                    # トークン文字列取得 (func_tokenizer利用)
+                    tokens = []
+                    if hasattr(model, "func_tokenizer") and hasattr(batch, "func"):
+                        func_text = batch.func[0] if isinstance(batch.func, list) else batch.func
+                        enc = model.func_tokenizer(func_text, truncation=True, max_length=512)
+                        tokens = model.func_tokenizer.convert_ids_to_tokens(enc["input_ids"])
+                        # サイズ合わせ
+                        weights = weights[:weights.size(0), :len(tokens)]
+
+                    plt.figure(figsize=(10, 8))
+                    sns.heatmap(weights.numpy(), xticklabels=tokens, yticklabels=False, cmap="viridis")
+                    plt.title(f"Cross Attention (Epoch {epoch})")
+                    plt.xlabel("Code Tokens")
+                    plt.ylabel("Graph Nodes")
+                    wandb.log({"Analysis/AttentionMap": wandb.Image(plt), "Epoch": epoch})
+                    plt.close()
+
+            # --- ★ 誤答分析: High Confidence Mistakes ---
+            # 確率 > 0.9 で間違えたものを収集 (各エポック最大20件まで)
+            if len(mistake_table_data) < 20:
+                is_wrong = (pred != batch.y)
+                high_conf = (probs.max(dim=-1).values > 0.7)
+                indices = (is_wrong & high_conf).nonzero(as_tuple=True)[0]
+                
+                for idx in indices:
+                    if len(mistake_table_data) >= 20: break
+                    idx = idx.item()
+                    
+                    # コードテキスト取得
+                    code_text = "N/A"
+                    if hasattr(batch, "func"):
+                        f_data = batch.func
+                        if isinstance(f_data, (list, tuple)): code_text = f_data[idx]
+                        elif isinstance(f_data, str): code_text = f_data
+                    
+                    mistake_table_data.append([
+                        epoch,
+                        code_text[:500], # 長すぎるのでトリミング
+                        y_true_batch[idx],
+                        y_pred_batch[idx],
+                        probs[idx, y_pred_batch[idx]].item()
+                    ])
+            
+            # バッファクリア
+            attn_weights_buffer.clear()
+
+    # フック解除
+    if handle: handle.remove()
 
     avg_loss = total_loss / max(1, n_batches)
 
@@ -457,6 +586,32 @@ def validate(model, val_loader, plot_prefix: str = "val"):
     precision = precision_score(y_true, y_pred_labels, zero_division=0)
     recall = recall_score(y_true, y_pred_labels, zero_division=0)
     f1 = f1_score(y_true, y_pred_labels, zero_division=0)
+
+
+    # 混同行列
+    wandb.log({
+        "Val/ConfusionMatrix": wandb.plot.confusion_matrix(
+            probs=None,
+            y_true=y_true, preds=y_pred_labels,
+            class_names=["Safe", "Vulnerable"]
+        ),
+        "Epoch": epoch
+    })
+
+    # 誤答テーブル
+    if mistake_table_data:
+        columns = ["Epoch", "Code", "True", "Pred", "Confidence"]
+        wandb.log({"Mistakes/HighConfidence": wandb.Table(data=mistake_table_data, columns=columns), "Epoch": epoch})
+
+    # Metrics
+    wandb.log({
+        "Val/Loss": avg_loss,
+        "Val/Accuracy": accuracy,
+        "Val/Precision": precision,
+        "Val/Recall": recall,
+        "Val/F1": f1,
+        "Epoch": epoch
+    })
 
     # 混同行列を保存（plots/ 配下に）
     cm = confusion_matrix(y_true, y_pred_labels)
@@ -1005,7 +1160,7 @@ if __name__ == '__main__':
         if not train_files:
             raise RuntimeError("train split が空です。")
         
-        # ★ 学習に実際に使う「有効サンプル数」を数える
+        # 学習サンプルのカウント
         cnt0, cnt1 = _count_targets_in_files(train_files, require_input=True)
         total_samples_raw = max(1, cnt0 + cnt1)
 
@@ -1017,60 +1172,38 @@ if __name__ == '__main__':
             freq1 = cnt1 / total_samples_raw
             w0 = 0.5 / freq0
             w1 = 0.5 / freq1
-
-            print(
-                f"[ClassCount] num0={cnt0}, num1={cnt1}, "
-                f"raw_total={total_samples_raw}, w0={w0:.4f}, w1={w1:.4f}"
-            )
+            print(f"[ClassCount] num0={cnt0}, num1={cnt1}, total={total_samples_raw}, w0={w0:.4f}, w1={w1:.4f}")
             class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
 
-        #criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
         criterion = FocalLoss(alpha=class_weights, gamma=2.0).to(device)
         print("Using Focal Loss with gamma=2.0")
-        print("Class weights:", class_weights)
 
-        # ★★ ここから：HPチューニング用のサブセットサイズを決定 ★★
+        # === ★ここが修正ポイント: サブセット計算ロジック ===
+        # デバッグ用: 引数が正しく渡っているか確認
+        print(f"[DEBUG] args.no_subset = {args.no_subset}, args.subset_frac = {args.subset_frac}")
+
         if args.no_subset:
+            # --no_subset が指定された場合：全データ使用
             effective_samples = total_samples_raw
-            print(f"[Subset] Disabled. Use ALL {total_samples_raw} train samples per epoch.")
+            print(f"[Subset] Disabled via --no_subset. Use ALL {total_samples_raw} samples.")
         else:
+            # 指定がない場合：subset_frac (デフォルト0.1) を使用
             frac = max(0.0, min(args.subset_frac, 1.0))
             if frac <= 0.0:
                 effective_samples = total_samples_raw
-                print(f"[Subset] subset_frac<=0 → 全サンプル使用 ({total_samples_raw})")
             else:
                 effective_samples = int(total_samples_raw * frac)
-                effective_samples = max(1, effective_samples)  # 最低1は確保
+                effective_samples = max(1, effective_samples)
+            
+            print(f"[Subset] Enabled. frac={frac} -> effective_samples={effective_samples}")
+        # ================================================
 
-            print(
-                f"[Subset] total_samples_raw={total_samples_raw}, "
-                f"subset_frac={frac}, "
-                f"effective_samples_per_epoch={effective_samples}"
-            )
-
-                # 探索するバッチサイズと学習率の候補
-        if args.batch_size is not None:
-            batch_candidates = [args.batch_size]
-            print(f"[HP] batch_size 指定あり → {batch_candidates}")
-        else:
-            batch_candidates = [8, 16, 32]
-            print(f"[HP] batch_size sweep → {batch_candidates}")
-
-        if args.lr is not None:
-            lr_candidates = [args.lr]
-            print(f"[HP] lr 指定あり → {lr_candidates}")
-        else:
-            lr_candidates = [1e-4, 5e-5, 3e-5, 1e-5]
-            print(f"[HP] lr sweep → {lr_candidates}")
-
-        if args.bert_lr_ratio is not None:
-            bert_lr_ratios = [args.bert_lr_ratio]
-            print(f"[HP] bert_lr_ratio 指定あり → {bert_lr_ratios}")
-        else:
-            bert_lr_ratios = [0.1, 0.2, 0.3]
-            print(f"[HP] bert_lr_ratio sweep → {bert_lr_ratios}")
-
-        patience = max(1, args.patience)
+        # パラメータ候補
+        batch_candidates = [args.batch_size] if args.batch_size else [8, 16, 32]
+        lr_candidates = [args.lr] if args.lr else [1e-4, 5e-5, 3e-5, 1e-5]
+        bert_lr_ratios = [args.bert_lr_ratio] if args.bert_lr_ratio else [0.1, 0.2, 0.3]
+        
+        patience = args.patience
         NUM_EPOCHS = context.epochs
         print(f"[EarlyStopping] patience={patience}")
 
@@ -1107,6 +1240,24 @@ if __name__ == '__main__':
                     print("-" * 60)
                     print(f"[SWEEP] batch_size={batch_size}, lr={lr}, bert_lr_ratio={bert_ratio}")
                     print("-" * 60)
+
+
+                    # ★ W&B Init
+                    run_name = f"bs{batch_size}_lr{lr}_br{bert_ratio}"
+                    wandb.init(
+                        project="graduation-project-six", # プロジェクト名は適宜変更してください
+                        name=run_name,
+                        config={
+                            "batch_size": batch_size,
+                            "lr": lr,
+                            "bert_ratio": bert_ratio,
+                            "model_type": args.model_type,
+                            "dataset": args.dataset
+                        },
+                        reinit=True
+                    )
+                    
+                    print(f"--- Start Run: {run_name} ---")
 
                     # モデルを新規に構築（毎回リセット）
                     # 必要なクラスをインポート
@@ -1195,161 +1346,29 @@ if __name__ == '__main__':
                     best_epoch = -1
                     wait = 0
 
+                    
                     for epoch in range(1, NUM_EPOCHS + 1):
-                        # --- 学習 ---
-                        train_loss, w_c, w_g = train(
-                            model, train_loader, optimizer, epoch, criterion, scheduler=scheduler
-                        )
-
+                        # Train
+                        train(model, train_loader, optimizer, epoch, criterion, scheduler)
+                        
+                        # Validate (W&Bログ含む)
                         if val_loader is not None:
                             plot_prefix = f"val_bs{batch_size}_lr{lr_str}_br{ratio_str}_ep{epoch}"
-                            val_loss, acc, precision, recall, f1 = validate(
-                                model, val_loader, plot_prefix=plot_prefix
-                            )
-
-                            history["epoch"].append(epoch)
-                            history["train_loss"].append(train_loss)
-                            history["val_loss"].append(val_loss)
-                            history["val_acc"].append(acc)
-                            history["val_prec"].append(precision)
-                            history["val_rec"].append(recall)
-                            history["val_f1"].append(f1)
-                            history["avg_w_code"].append(w_c)
-                            history["avg_w_graph"].append(w_g)
-
-                            # ② Validation 上で「F1が最大になるしきい値」を探索
-                            best_t, best_stats = search_best_threshold(
-                                model, val_loader, num_steps=19
-                            )
-
-                            if best_stats is not None:
-                                acc_t, prec_t, rec_t, f1_t = best_stats
-                                f1_for_es = f1_t        # EarlyStopping 用
-                                used_threshold = best_t # ログ用
-                            else:
-                                # 念のため、探索に失敗したときは従来の F1 を使う
-                                f1_for_es = f1
-                                used_threshold = 0.5
-
-                            # ④ F1 改善チェック（EarlyStopping は「ベストしきい値の F1」で判定）
-                            if f1_for_es > best_f1 + 1e-4:
-                                best_f1 = f1_for_es
-                                best_epoch = epoch
+                            val_loss, acc, prec, rec, f1 = validate(model, val_loader, plot_prefix=plot_prefix)
+                            
+                            if f1 > best_f1:
+                                best_f1 = f1
                                 wait = 0
                                 torch.save(model.state_dict(), str(SAVE_PATH))
-                                saved_flag = " [SAVED]"
                             else:
                                 wait += 1
-                                saved_flag = ""
-
-                            # ⑤ ログには「F1@0.5」と「F1@best_t」の両方を出す
-                            print(
-                                f"Epoch {epoch}/{NUM_EPOCHS} | "
-                                f"Acc@0.5: {acc:.4f}, P@0.5: {precision:.4f}, "
-                                f"R@0.5: {recall:.4f}, F1@0.5: {f1:.4f}, "
-                                f"F1@best_t({used_threshold:.2f}): {f1_for_es:.4f}, "
-                                f"best F1: {best_f1:.4f} (epoch {best_epoch}){saved_flag} "
-                                f"wait={wait}/{patience}"
-                            )
-
-                            if wait >= patience:
-                                print(
-                                    f"[EarlyStopping] no F1 improvement for {patience} epochs. "
-                                    "Stop training."
-                                )
-                                break
-                        else:
-                            # val_loader が無い場合は毎エポック上書きで保存
-                            torch.save(model.state_dict(), str(SAVE_PATH))
-
-                    # この (batch_size, lr, bert_ratio) の結果を記録
-                    all_results.append({
-                        "batch_size": batch_size,
-                        "lr": lr,
-                        "bert_lr_ratio": bert_ratio,
-                        "bert_lr": bert_lr,
-                        "best_f1": float(best_f1),
-                        "best_epoch": int(best_epoch),
-                        "model_path": str(SAVE_PATH),
-                    })
-
-                    # 簡単な学習曲線を保存 (組み合わせごとに別ファイル)
-                    if history["epoch"]:
-                        # ① Loss 曲線
-                        plt.figure(figsize=(6, 4))
-                        plt.plot(history["epoch"], history["train_loss"], label="Train Loss")
-                        plt.plot(history["epoch"], history["val_loss"], label="Val Loss")
-                        plt.xlabel("Epoch")
-                        plt.ylabel("Loss")
-                        plt.legend()
-                        plt.grid(True)
-                        plt.tight_layout()
-                        plt.savefig(
-                            PLOT_DIR / f"loss_curve_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
-                        )
-                        plt.close()
-
-                        # ② Val の F1 / Recall / Precision
-                        plt.figure(figsize=(6, 4))
-                        plt.plot(history["epoch"], history["val_f1"], label="Val F1")
-                        plt.plot(history["epoch"], history["val_rec"], label="Val Recall")
-                        plt.plot(history["epoch"], history["val_prec"], label="Val Precision")
-                        plt.xlabel("Epoch")
-                        plt.ylabel("Score")
-                        plt.ylim(0.0, 1.0)
-                        plt.legend()
-                        plt.grid(True)
-                        plt.tight_layout()
-                        plt.savefig(
-                            PLOT_DIR / f"training_metrics_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
-                        )
-                        plt.close()
-
-                        # ③ Val Accuracy
-                        plt.figure(figsize=(6, 4))
-                        plt.plot(history["epoch"], history["val_acc"], label="Val Acc")
-                        plt.xlabel("Epoch")
-                        plt.ylabel("Accuracy")
-                        plt.ylim(0.0, 1.0)
-                        plt.grid(True)
-                        plt.tight_layout()
-                        plt.savefig(
-                            PLOT_DIR / f"training_acc_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
-                        )
-                        plt.close()
-
-                        plt.figure(figsize=(6, 4))
-                        plt.plot(history["epoch"], history["avg_w_code"], label="Weight: CodeBERT", marker="o")
-                        plt.plot(history["epoch"], history["avg_w_graph"], label="Weight: R-GCN", marker="x")
-                        plt.xlabel("Epoch")
-                        plt.ylabel("Gate Weight (avg)")
-                        plt.ylim(0.0, 1.0) # Softmaxなので0-1に収まるはず
-                        plt.legend()
-                        plt.grid(True)
-                        plt.title(f"Modality Weights (bs={batch_size}, lr={lr_str})")
-                        plt.tight_layout()
-                        
-                        # ファイル保存
-                        plot_filename = f"weights_curve_bs{batch_size}_lr{lr_str}_br{ratio_str}.png"
-                        plt.savefig(PLOT_DIR / plot_filename)
-                        plt.close()
-                        
-                        print(f"[Plot] Saved weights plot to {PLOT_DIR / plot_filename}")
-
-
-
-
-        # 全体の結果を表示（batch × lr × bert_ratio 全部）
-        print("\n===== SWEEP SUMMARY (sorted by best_f1) =====")
-        for r in sorted(all_results, key=lambda x: x["best_f1"], reverse=True):
-            print(
-                f"batch={r['batch_size']}, "
-                f"lr={r['lr']}, "
-                f"bert_ratio={r['bert_lr_ratio']}, "
-                f"bert_lr={r['bert_lr']}, "
-                f"best_f1={r['best_f1']:.4f} (epoch {r['best_epoch']}), "
-                f"model={r['model_path']}"
-            )
+                                if wait >= patience:
+                                    print("Early Stopping")
+                                    break
+                    
+                    # Run終了
+                    wandb.finish()
+                    
 
     # ------------------------------------------------------------
     # TEST モード：指定モデルでしきい値サーチ + 評価

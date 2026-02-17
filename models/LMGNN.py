@@ -113,36 +113,51 @@ def sanitize_for_rgcn(d, *, trim_x: bool = True, do_coalesce: bool = True):
 from transformers import AutoTokenizer
 
 
+
 class BertRGCN(nn.Module):
     def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None):
         super().__init__()
         self.device = device
 
         hidden_dim   = gated_graph_conv_args.get("out_channels", 200)
-        num_rel      = gated_graph_conv_args.get("num_relations", 3)
+        num_relations = gated_graph_conv_args.get("num_relations", 3)
         num_layers   = gated_graph_conv_args.get("num_layers", 6)
+        
         self.hidden_dim = hidden_dim
         self.code_dim   = emb_size
 
-        # R-GCN 用
-        self.input_proj = nn.Linear(emb_size, hidden_dim)
-        self.rgcn_layers = nn.ModuleList([
-            RGCNConv(hidden_dim, hidden_dim, num_rel)
-            for _ in range(num_layers)
-        ])
-
-        self.rgcn_norm = nn.LayerNorm(hidden_dim)
-
-        # ★ 用途② CodeBERT（トークン列用）
+        # --- 1. CodeBERT Encoder ---
         self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
         self.func_encoder   = CodeBERTEncoder(
             model_name="microsoft/codebert-base",
-            tune_last_n_layers=2,   # ここだけ finetune される
+            tune_last_n_layers=2,
         )
 
-        # GraphCodeFusion: code_dim を func_encoder.hidden_size に合わせる
+        # --- 2. Pre-GCN Processing (Contextualization) ★追加部分 ---
+        # CodeBERTの次元(768)を GCNの次元(200)に合わせる射影層
+        self.code_proj_pre = nn.Linear(self.func_encoder.hidden_size, hidden_dim)
+        
+        # ノード(Query) が コード(Key/Value) を参照するAttention
+        self.context_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.context_norm = nn.LayerNorm(hidden_dim)
+
+        # --- 3. R-GCN Layers (Standard) ---
+        self.input_proj = nn.Linear(emb_size, hidden_dim)
+        
+        self.rgcn_layers = nn.ModuleList([
+            RGCNConv(hidden_dim, hidden_dim, num_relations)
+            for _ in range(num_layers)
+        ])
+        self.rgcn_norm = nn.LayerNorm(hidden_dim)
+
+        # --- 4. Post-GCN Fusion (Final Integration) ---
         self.fusion = GraphCodeFusion(
-            code_dim=self.func_encoder.hidden_size,
+            code_dim=self.func_encoder.hidden_size, # 768
             graph_dim=hidden_dim,
             proj_dim=hidden_dim,
             num_heads=4,
@@ -159,46 +174,31 @@ class BertRGCN(nn.Module):
             nn.Linear(hidden_dim, 2)
         )
 
-
     def forward(self, data):
         x          = data.x
         edge_index = data.edge_index
         edge_type  = data.edge_type
 
-        # ★ node → graph インデックスを安全に作る
-        if isinstance(data, GeoBatch) and hasattr(data, "ptr") and data.ptr is not None:
-            # ptr: [0, n0, n0+n1, n0+n1+n2, ...]
-            num_nodes_per_graph = data.ptr[1:] - data.ptr[:-1]   # [B]
-            assert int(num_nodes_per_graph.sum().item()) == x.size(0), \
-                f"sum(ptr diff)={int(num_nodes_per_graph.sum().item())}, x.size(0)={x.size(0)} がズレてる"
-
-            batch_idx = torch.arange(num_nodes_per_graph.size(0), device=x.device) \
-                            .repeat_interleave(num_nodes_per_graph)   # [N_nodes]
-        else:
-            # 単一グラフ or last resort
-            batch_idx = x.new_zeros(x.size(0), dtype=torch.long)
-
-        # 1) R-GCN でノード埋め込み
-        h = self.input_proj(x)
-        for conv in self.rgcn_layers:
-            h = F.relu(conv(h, edge_index, edge_type))
-
-        h = self.rgcn_norm(h)
-
-        
-
-        graph_dense, graph_mask = to_dense_batch(h, batch_idx)
-
-        # 2) 関数コードをトークナイズして CodeBERT に通す
+        # ============================================================
+        # Step 1: CodeBERT Encoding (文脈情報の取得)
+        # ============================================================
         funcs = getattr(data, "func", None)
+        
+        # バッチサイズ計算
+        if isinstance(data, GeoBatch) and hasattr(data, "ptr") and data.ptr is not None:
+            num_nodes_per_graph = data.ptr[1:] - data.ptr[:-1]
+            batch_idx = torch.arange(num_nodes_per_graph.size(0), device=x.device) \
+                            .repeat_interleave(num_nodes_per_graph)
+            B = num_nodes_per_graph.size(0)
+        else:
+            batch_idx = x.new_zeros(x.size(0), dtype=torch.long)
+            B = 1
+
+        # CodeBERT実行
         if funcs is None:
-            print("func is None. That is why code mask is None. Tokenized code is composed of 0")
-            # 念のため保険：func がない場合は 0 ベクトル
-            B = graph_dense.size(0)
-            code_emb = graph_dense.new_zeros(B, 1, self.func_encoder.hidden_size)
+            code_emb = x.new_zeros(B, 1, self.func_encoder.hidden_size)
             code_mask = None
         else:
-            # PyG の Batch では data.func は list[str] になっている想定
             if isinstance(funcs, str):
                 funcs = [funcs]
             enc = self.func_tokenizer(
@@ -206,28 +206,76 @@ class BertRGCN(nn.Module):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512,  # 必要に応じて調整
+                max_length=512,
             )
-            input_ids     = enc["input_ids"].to(self.device)
-            attention_mask = enc["attention_mask"].to(self.device)  # [B, L_code]
+            input_ids      = enc["input_ids"].to(self.device)
+            attention_mask = enc["attention_mask"].to(self.device)
 
-            # ★ トークン列を取得（CLS ではない）
             code_emb = self.func_encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                return_cls=False,        # [B, L_code, H]
+                return_cls=False,        # [B, L_code, 768]
             )
-            code_mask = attention_mask  # そのまま mask に使える
+            code_mask = attention_mask   # [B, L_code]
 
-        # 3) トークン列 vs ノード列で Cross-Attention
+        # ============================================================
+        # Step 2: Contextualized Node Features (ノードへの文脈注入) ★追加部分
+        # ============================================================
+        # ノード特徴量の初期投影
+        h_nodes = self.input_proj(x)  # [Total_Nodes, hidden_dim]
+        
+        # CodeBERT出力をGCN次元に射影: [B, L, 768] -> [B, L, 200]
+        code_emb_proj = self.code_proj_pre(code_emb)
+
+        # ノードをバッチ単位のDense形式に変換: [B, Max_Nodes, 200]
+        h_nodes_dense, node_mask = to_dense_batch(h_nodes, batch_idx)
+
+        # Attention用のマスク準備 (True=無視したい場所)
+        if code_mask is not None:
+            # code_maskは 1=有効, 0=padding なので反転させる
+            key_padding_mask = (code_mask == 0)
+        else:
+            key_padding_mask = None
+
+        # Cross-Attention: Nodes(Q) <- Code(K, V)
+        # 各ノードが、コードのトークン列全体を見に行く
+        attn_out, _ = self.context_attn(
+            query=h_nodes_dense,
+            key=code_emb_proj,
+            value=code_emb_proj,
+            key_padding_mask=key_padding_mask
+        )
+
+        # 残差接続 & Norm (Contextualized Nodes)
+        h_nodes_dense = self.context_norm(h_nodes_dense + attn_out)
+
+        # Dense状態から元のFlatな[Total_Nodes, 200]に戻す
+        h_nodes = h_nodes_dense[node_mask]
+
+        # ============================================================
+        # Step 3: R-GCN (グラフ畳み込み)
+        # ============================================================
+        # コンテキスト化された特徴量(h_nodes)を初期値として開始
+        h = h_nodes 
+        for conv in self.rgcn_layers:
+            h = F.relu(conv(h, edge_index, edge_type))
+        
+        h = self.rgcn_norm(h)
+
+        # ============================================================
+        # Step 4: Final Fusion & Classification
+        # ============================================================
+        # 再度Dense化してFusion層へ
+        graph_dense, graph_mask = to_dense_batch(h, batch_idx)
+
+        # Fusion (code_embは元の768次元のものを使用 -> Fusion内で射影される)
         graph_repr = self.fusion(
-            code_emb=code_emb,              # [B, L_code, H]
-            graph_emb=graph_dense,          # [B, L_graph, D]
+            code_emb=code_emb,              # [B, L_code, 768]
+            graph_emb=graph_dense,          # [B, L_graph, 200]
             code_mask=code_mask,            # [B, L_code]
             graph_mask=graph_mask,          # [B, L_graph]
-        )                                   # → [B, hidden_dim]
+        )                                   # -> [B, hidden_dim]
 
-        # 4) 分類
         logits = self.classifier(graph_repr)
         return logits
     

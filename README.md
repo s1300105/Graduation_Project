@@ -9,6 +9,11 @@ BigVulデータセットをクリーンしてJsonlにする。
 DiverseVulデータセットをクリーンしてJsonlにする。
 (venv) yudai@lyuyan-X570-AORUS-ELITE:~/Project/research/Graduation_Project$ python data/scripts/make_diversevul_json.py --input_json data/raw/diversevul_20230702.json --output_jsonl data/cleaned_data/diversevul.jsonl
 
+PrimeVulデータセットをクリーンする
+(venv) yudai@lyuyan-X570-AORUS-ELITE:~/Project/research/Graduation_Project$ python data/scripts/clean_primevul.py --output_jsonl data/cleaned_data/primevul_defect.jsonl
+
+
+
 クリーンして、分割後のBigVulとDiverseVulのデータセットはdata/cleaned_data/内にある。
 DiverseVulでつかわれていた、過去のプロジェクトをたくさん合わせて、プロジェクトごとに訓練、検証、テスト内で重複しないようにしたデータセットはdata/raw/new_six_by_projectsフォルダ内にある。
 
@@ -279,4 +284,14 @@ python main.py --dataset diversevul --mode test
 
 
 訓練のコマンドでデータセットを指定しても意味ない。ここでは、直近に作られたcpgとembedで使ったデータセットをつかう。そのため、diversevulを前回使って、今回はBigVulを使いたい場合はBigVulでCPGとEmbedを作る必要がある。
+
+
+
+# 使い方例
+Bigvul データセットを使用して、以下の条件でパラメータファインチューニングする時
+patience=30, データセットは１エポックで全体を使う。
+
+=> (venv) yudai@lyuyan-X570-AORUS-ELITE:~/Project/research/Graduation_Project$ python run.py -mode train -path ./data/trained_models/model_patience=30_subsetfrac_0.1_dataset_bigvul/ --patience 30 --no_subset --dataset bigvul
+
+モデルを収納するファイルは-pathで指定する
 
