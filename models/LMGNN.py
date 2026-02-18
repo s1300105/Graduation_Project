@@ -115,7 +115,7 @@ from transformers import AutoTokenizer
 
 
 class BertRGCN(nn.Module):
-    def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None):
+    def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None, debug_shapes: bool = False, log_wandb: bool = False, wandb_prefix: str = 'debug'):
         super().__init__()
         self.device = device
 
@@ -133,9 +133,17 @@ class BertRGCN(nn.Module):
             tune_last_n_layers=2,
         )
 
+        # Align internal hidden dimension to CodeBERT hidden size (e.g. 768)
+        # Override any previous default hidden_dim so that Graph and CodeLMs use the same dimension
+        hidden_dim = self.func_encoder.hidden_size
+        self.hidden_dim = hidden_dim
+
         # --- 2. Pre-GCN Processing (Contextualization) ★追加部分 ---
-        # CodeBERTの次元(768)を GCNの次元(200)に合わせる射影層
-        self.code_proj_pre = nn.Linear(self.func_encoder.hidden_size, hidden_dim)
+        # If CodeBERT output size equals target hidden_dim, projection can be Identity
+        if self.func_encoder.hidden_size == hidden_dim:
+            self.code_proj_pre = nn.Identity()
+        else:
+            self.code_proj_pre = nn.Linear(self.func_encoder.hidden_size, hidden_dim)
         
         # ノード(Query) が コード(Key/Value) を参照するAttention
         self.context_attn = nn.MultiheadAttention(
@@ -148,7 +156,6 @@ class BertRGCN(nn.Module):
 
         # --- 3. R-GCN Layers (Standard) ---
         self.input_proj = nn.Linear(emb_size, hidden_dim)
-        
         self.rgcn_layers = nn.ModuleList([
             RGCNConv(hidden_dim, hidden_dim, num_relations)
             for _ in range(num_layers)
@@ -173,6 +180,18 @@ class BertRGCN(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, 2)
         )
+        # whether to print tensor shapes before cross-attention (useful for debugging)
+        self.debug_shapes = debug_shapes
+        # optional wandb logging
+        self.log_wandb = log_wandb
+        self.wandb_prefix = wandb_prefix
+        self._wandb = None
+        if self.log_wandb:
+            try:
+                import wandb
+                self._wandb = wandb
+            except Exception:
+                self._wandb = None
 
     def forward(self, data):
         x          = data.x
@@ -239,6 +258,33 @@ class BertRGCN(nn.Module):
 
         # Cross-Attention: Nodes(Q) <- Code(K, V)
         # 各ノードが、コードのトークン列全体を見に行く
+        # Optionally log/print shapes before attention
+        if getattr(self, 'debug_shapes', False):
+            try:
+                kp_shape = None if key_padding_mask is None else tuple(key_padding_mask.shape)
+                shape_info = {
+                    f"{self.wandb_prefix}/h_nodes_dense_shape": str(tuple(h_nodes_dense.shape)),
+                    f"{self.wandb_prefix}/code_emb_proj_shape": str(tuple(code_emb_proj.shape)),
+                    f"{self.wandb_prefix}/key_padding_mask_shape": str(kp_shape)
+                }
+                # print to stdout for quick debugging
+                print(f"[debug] h_nodes_dense.shape={tuple(h_nodes_dense.shape)}, code_emb_proj.shape={tuple(code_emb_proj.shape)}, key_padding_mask.shape={kp_shape}")
+                # log to wandb if available
+                if self._wandb is not None:
+                    # wandb.log expects numeric values; log shapes as strings under step-less dict
+                    try:
+                        self._wandb.log(shape_info)
+                    except Exception:
+                        # fallback: log counts (dimensions) as numbers
+                        try:
+                            hd = tuple(h_nodes_dense.shape)
+                            ce = tuple(code_emb_proj.shape)
+                            self._wandb.log({f"{self.wandb_prefix}/h_nodes_dense_dim0": hd[0], f"{self.wandb_prefix}/h_nodes_dense_dim1": hd[1], f"{self.wandb_prefix}/code_emb_proj_dim0": ce[0], f"{self.wandb_prefix}/code_emb_proj_dim1": ce[1]})
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         attn_out, _ = self.context_attn(
             query=h_nodes_dense,
             key=code_emb_proj,

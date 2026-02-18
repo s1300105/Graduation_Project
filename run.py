@@ -41,6 +41,23 @@ import wandb
 from pyvis.network import Network
 from torch_geometric.utils import to_networkx
 
+# Ensure local project directory is first on sys.path so our `utils` package is imported
+import sys
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Quick sanity check: if a different `utils` is picked up, warn the user
+try:
+    import importlib
+    spec = importlib.util.find_spec('utils')
+    if spec and spec.origin:
+        utils_path = Path(spec.origin).resolve()
+        if not str(utils_path).startswith(str(PROJECT_ROOT)):
+            print(f"[WARN] 'utils' resolved to {utils_path}, which is outside the project root. Local 'utils' may be shadowed.")
+except Exception:
+    pass
+
 
 PLOT_DIR = Path("./plots")
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -399,6 +416,46 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
     for batch_idx, batch in enumerate(train_loader):
         try:
             batch = batch.to(device, non_blocking=True)
+
+            # --- DEBUG: log input vector dimensions on first batch ---
+            if batch_idx == 0:
+                try:
+                    info = {}
+                    # common tensor-like attribute names used in this project
+                    candidate_names = (
+                        'x', 'node_feat', 'node_features', 'code_emb', 'code_embedding',
+                        'input', 'func_embeddings', 'emb', 'features'
+                    )
+                    for name in candidate_names:
+                        attr = getattr(batch, name, None)
+                        if isinstance(attr, torch.Tensor):
+                            info[f'{name}.shape'] = tuple(attr.size())
+                        elif isinstance(attr, (list, tuple)):
+                            info[f'{name}.len'] = len(attr)
+                        elif attr is not None:
+                            info[f'{name}'] = str(type(attr))
+
+                    # PyG standard: batch.x may exist
+                    if hasattr(batch, 'x') and isinstance(batch.x, torch.Tensor):
+                        info['batch.x.shape'] = tuple(batch.x.size())
+
+                    # Log the model embedding size if available globally
+                    try:
+                        emb = globals().get('emb_size', None)
+                        info['emb_size'] = int(emb) if emb is not None else None
+                    except Exception:
+                        info['emb_size'] = str(type(emb))
+
+                    print(f"[INPUT SHAPES] {info}")
+                    try:
+                        # convert non-numeric values to strings for wandb
+                        log_info = {f"Input/{k}": (v if isinstance(v, (int, float)) else str(v)) for k, v in info.items()}
+                        wandb.log(log_info)
+                    except Exception:
+                        pass
+                except Exception as _e:
+                    print(f"[DEBUG] failed to log input shapes: {_e}")
+
             optimizer.zero_grad(set_to_none=True)
 
             y_pred = model(batch)
@@ -1262,8 +1319,6 @@ if __name__ == '__main__':
                     # モデルを新規に構築（毎回リセット）
                     # 必要なクラスをインポート
                     from models.LMGNN import BertRGCN, CodeBERTOnly
-
-                    # ... (中略) ...
 
                     # モデル初期化ロジック (trainループ内およびtestモード内)
                     if args.model_type == 'codebert':
