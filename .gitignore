@@ -106,3 +106,8 @@ data/cpg_dataset_verifier_eb96b0.ipynb
 data/inspect/*.json
 data/inspect/
 data/*.ipynb
+data/raw.zip
+lib/*
+data/check_data/cpg_head_check.json
+data/data_for_checking/*
+plots*/
