@@ -41,6 +41,23 @@ import wandb
 from pyvis.network import Network
 from torch_geometric.utils import to_networkx
 
+# Ensure local project directory is first on sys.path so our `utils` package is imported
+import sys
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Quick sanity check: if a different `utils` is picked up, warn the user
+try:
+    import importlib
+    spec = importlib.util.find_spec('utils')
+    if spec and spec.origin:
+        utils_path = Path(spec.origin).resolve()
+        if not str(utils_path).startswith(str(PROJECT_ROOT)):
+            print(f"[WARN] 'utils' resolved to {utils_path}, which is outside the project root. Local 'utils' may be shadowed.")
+except Exception:
+    pass
+
 
 PLOT_DIR = Path("./plots")
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,6 +73,16 @@ test_path  = "/home/yudai/Project/research/Graduation_Project/data/raw/new_six_b
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 class FocalLoss(torch.nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
@@ -66,9 +93,17 @@ class FocalLoss(torch.nn.Module):
 
     def forward(self, inputs, targets):
         # inputs: [B, C], targets: [B]
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
-        pt = torch.exp(-ce_loss)  # pt = p (正解クラスの確率)
+        # pt は重みなしの確率から計算する（weight を使うと pt = p_t^alpha_t になってしまうため）
+        with torch.no_grad():
+            probs = F.softmax(inputs, dim=-1)          # [B, C]
+            pt = probs.gather(1, targets.view(-1, 1)).squeeze(1)  # [B] 正解クラスの確率
+        # weightはF.cross_entropyには渡さず、フォーカル係数と分離して後で掛ける
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        # クラス重みを別途適用（二重重み付け防止）
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
 
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -399,45 +434,93 @@ def train(model, train_loader, optimizer, epoch, criterion, scheduler=None):
     for batch_idx, batch in enumerate(train_loader):
         try:
             batch = batch.to(device, non_blocking=True)
+
+            # --- DEBUG: log input vector dimensions on first batch ---
+            if batch_idx == 0:
+                try:
+                    info = {}
+                    # common tensor-like attribute names used in this project
+                    candidate_names = (
+                        'x', 'node_feat', 'node_features', 'code_emb', 'code_embedding',
+                        'input', 'func_embeddings', 'emb', 'features'
+                    )
+                    for name in candidate_names:
+                        attr = getattr(batch, name, None)
+                        if isinstance(attr, torch.Tensor):
+                            info[f'{name}.shape'] = tuple(attr.size())
+                        elif isinstance(attr, (list, tuple)):
+                            info[f'{name}.len'] = len(attr)
+                        elif attr is not None:
+                            info[f'{name}'] = str(type(attr))
+
+                    # PyG standard: batch.x may exist
+                    if hasattr(batch, 'x') and isinstance(batch.x, torch.Tensor):
+                        info['batch.x.shape'] = tuple(batch.x.size())
+
+                    # Log the model embedding size if available globally
+                    try:
+                        emb = globals().get('emb_size', None)
+                        info['emb_size'] = int(emb) if emb is not None else None
+                    except Exception:
+                        info['emb_size'] = str(type(emb))
+
+                    print(f"[INPUT SHAPES] {info}")
+                    try:
+                        # convert non-numeric values to strings for wandb
+                        log_info = {f"Input/{k}": (v if isinstance(v, (int, float)) else str(v)) for k, v in info.items()}
+                        wandb.log(log_info)
+                    except Exception:
+                        pass
+                except Exception as _e:
+                    print(f"[DEBUG] failed to log input shapes: {_e}")
+
             optimizer.zero_grad(set_to_none=True)
 
             y_pred = model(batch)
             batch.y = batch.y.view(-1).long()
             loss = criterion(y_pred, batch.y)
-            loss.backward()
 
             loss_val = loss.item()
+            # NaN/inf損失が出たらパラメータを壊さずスキップ
+            if not math.isfinite(loss_val):
+                print(f"[WARN] Non-finite loss ({loss_val}) at step {batch_idx+1}. Skipping.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             total_loss += loss_val
             n_batches += 1
 
-            # ★ 追加: 重みの取得 (LMGNN.pyの修正が前提)
-            
-
-            # ★ 修正: fusion属性がある場合のみ重みを取得
+            # fusionの重みを取得（未定義変数防止のため先にデフォルト値を設定）
+            w_c, w_g = 0.0, 0.0
             if hasattr(model, "fusion") and hasattr(model.fusion, "last_weights"):
                 w_c = model.fusion.last_weights["code"]
                 w_g = model.fusion.last_weights["graph"]
-                total_w_code += w_c
-                total_w_graph += w_g
-            else:
-                # CodeBERTOnlyの場合などは重みがないので適当な値あるいは0を入れる
-                total_w_code += 0.0
-                total_w_graph += 0.0
+            total_w_code += w_c
+            total_w_graph += w_g
 
             # ログ表示 (必要に応じて)
             if (batch_idx+1) % 200 == 0:
                 _diag_logits("train", y_pred, batch.y)
-            
-            wandb.log({
-                "Train/StepLoss": loss_val,
-                "Train/LR": optimizer.param_groups[0]['lr'],
-                "Weights/Code": w_c,
-                "Weights/Graph": w_g
-            })
 
+            # optimizer.step() を先に実行してからログ（LRはstep後の値を記録）
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
+                # LRが実質0になったら警告（崩壊の早期検知）
+                current_lr = optimizer.param_groups[0]['lr']
+                if current_lr < 1e-8 and batch_idx % 100 == 0:
+                    print(f"[WARN] LR={current_lr:.2e} at step {batch_idx+1}. Scheduler may have expired.")
+
+            wandb.log({
+                "Train/StepLoss": loss_val,
+                "Train/LR": optimizer.param_groups[0]['lr'],
+                "Train/GradNorm": grad_norm.item(),
+                "Weights/Code": w_c,
+                "Weights/Graph": w_g
+            })
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -509,14 +592,11 @@ def validate(model, val_loader, plot_prefix: str = "val"):
             y_true_batch = batch.y.cpu().tolist()
             y_pred_batch = pred.cpu().tolist()
 
-            y_true.extend(batch.y.cpu().tolist())
-            y_pred_labels.extend(pred.cpu().tolist())
+            y_true.extend(y_true_batch)
+            y_pred_labels.extend(y_pred_batch)
 
             # ★ ロジット診断を逐次更新
             _diag_logits_update(diag_state, logits, batch.y)
-
-            y_true.extend(y_true_batch)
-            y_pred_labels.extend(y_pred_batch)
             
             # --- ★ 可視化: 最初のバッチのみ & 特定エポックのみ ---
             if batch_idx == 0:
@@ -762,20 +842,35 @@ class StreamGraphDataset(IterableDataset):
     <split>_*.pkl を逐次読み込み → 小さめバッファに貯めて（疑似）シャッフル → yield
     * buffer_size は batch_size×8〜16 が目安（OOM 回避のため小さめ）
     """
-    def __init__(self, files, *, buffer_size=128, shuffle=True):
+    def __init__(self, files, *, buffer_size=128, shuffle=True, rank: int | None = None, world_size: int | None = None):
         super().__init__()
         self.files = list(sorted(files))
         self.buffer_size = int(buffer_size)
         self.shuffle = bool(shuffle)
+        # rank/world_size can be supplied (used in distributed runs). If None they'll be resolved at runtime from globals.
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         rng = random.Random(42 + (os.getpid() if hasattr(os, "getpid") else 0))
         buffer = []
+        # resolve rank/world_size from instance or module globals set in __main__
+        rank = self.rank if self.rank is not None else globals().get("GLOBAL_RANK", 0)
+        world_size = self.world_size if self.world_size is not None else globals().get("GLOBAL_WORLD_SIZE", 1)
+        # global index across all samples to perform simple round-robin partitioning
+        global_idx = 0
+
         for fn in self.files:
             df = pd.read_pickle(fn)  # （.pkl 形式想定）
             try:
                 # itertuples は iterrows より低オーバーヘッド
                 for row in df.itertuples(index=False):
+                    # simple round-robin partitioning: only process rows assigned to this rank
+                    take = (global_idx % max(1, world_size)) == rank
+                    global_idx += 1
+                    if not take:
+                        continue
+
                     # row は列名を属性に持つ namedtuple
                     g = getattr(row, "input", None)
                     if g is None:
@@ -916,12 +1011,15 @@ def make_stream_loader_for_split(
     buffer_size: int,
     shuffle: bool,
     max_samples: int | None = None,
+    rank: int | None = None,
+    world_size: int | None = None,
 ):
     files = _split_file_paths(split)
     if not files:
         return None
 
-    ds = StreamGraphDataset(files, buffer_size=buffer_size, shuffle=shuffle)
+    # pass rank/world_size to StreamGraphDataset so each process gets a disjoint partition
+    ds = StreamGraphDataset(files, buffer_size=buffer_size, shuffle=shuffle, rank=rank, world_size=world_size)
 
     # ★ サブセット指定があれば、最大 max_samples 件で打ち切る
     if max_samples is not None and max_samples > 0:
@@ -1046,8 +1144,12 @@ def _load_split_inputs(split: str):
 # ------------------------------------------------------------
 # メイン
 # ------------------------------------------------------------
-if __name__ == '__main__':
+if __name__ == "__main__":
+    import argparse, torch.distributed as dist, torch
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--distributed", action="store_true")
+    parser.add_argument("--local_rank", type=int, default=0)  # torchrun / launch から渡る
     parser.add_argument('-cpg', '--cpg', action='store_true', help='CPG generation task')
     parser.add_argument('-embed', '--embed', action='store_true', help='Embedding generation task')
     parser.add_argument('-mode', '--mode', default="train", help='train / test')
@@ -1101,6 +1203,13 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='再現性のための乱数シード (default: 42)'
+    )
+
+    parser.add_argument(
         '--model_type',
         choices=['hybrid', 'codebert'],
         default='hybrid',
@@ -1109,6 +1218,46 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    set_seed(args.seed)
+    print(f"[Seed] {args.seed}")
+
+    # 初期化: distributed フラグに応じてプロセスグループを初期化
+    if args.distributed:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        device = torch.device("cuda", args.local_rank)
+        GLOBAL_RANK = dist.get_rank()
+        GLOBAL_WORLD_SIZE = dist.get_world_size()
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        GLOBAL_RANK = 0
+        GLOBAL_WORLD_SIZE = 1
+
+    # convenience flag: is this main (rank 0) process?
+    IS_MAIN = (GLOBAL_RANK == 0)
+
+    # If not main, replace wandb with a light-weight dummy to avoid remote API calls/errors
+    if not IS_MAIN:
+        class _DummyPlot:
+            def confusion_matrix(self, *a, **k):
+                return None
+        class _DummyWandb:
+            def init(self, *a, **k):
+                return None
+            def log(self, *a, **k):
+                return None
+            def finish(self, *a, **k):
+                return None
+            def Html(self, *a, **k):
+                return None
+            def Table(self, *a, **k):
+                return None
+            def Image(self, *a, **k):
+                return None
+            plot = _DummyPlot()
+        wandb = _DummyWandb()
+
+    # データセットパスの設定
     if args.dataset == 'bigvul':
         train_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/bigvul_defect_train.jsonl"
         valid_path = "/home/yudai/Project/research/Graduation_Project/data/cleaned_data/bigvul_defect_valid.jsonl"
@@ -1168,12 +1317,11 @@ if __name__ == '__main__':
             print(f"[WARN] cnt0={cnt0}, cnt1={cnt1}. クラス重みを 1.0 に固定します。")
             class_weights = torch.tensor([1.0, 1.0], dtype=torch.float32, device=device)
         else:
-            freq0 = cnt0 / total_samples_raw
-            freq1 = cnt1 / total_samples_raw
-            w0 = 0.5 / freq0
-            w1 = 0.5 / freq1
-            print(f"[ClassCount] num0={cnt0}, num1={cnt1}, total={total_samples_raw}, w0={w0:.4f}, w1={w1:.4f}")
-            class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+            # 逆頻度重み: BalancedBatcher が既に50/50サンプリングするため sqrt スケールで過剰補正を防ぐ
+            w1 = math.sqrt(cnt0 / cnt1)  # 例: cnt0=4850, cnt1=150 → w1≈4.95
+            print(f"[ClassCount] num0={cnt0}, num1={cnt1}, total={total_samples_raw}, w1={w1:.2f}")
+            class_weights = torch.tensor([1.0, w1], dtype=torch.float32, device=device)
+            print(f"[ClassWeights] w0=1.0, w1={w1:.2f}")
 
         criterion = FocalLoss(alpha=class_weights, gamma=2.0).to(device)
         print("Using Focal Loss with gamma=2.0")
@@ -1263,17 +1411,35 @@ if __name__ == '__main__':
                     # 必要なクラスをインポート
                     from models.LMGNN import BertRGCN, CodeBERTOnly
 
-                    # ... (中略) ...
-
                     # モデル初期化ロジック (trainループ内およびtestモード内)
                     if args.model_type == 'codebert':
-                        print("[MODEL] Using CodeBERT Only baseline.")
+                        if IS_MAIN: print("[MODEL] Using CodeBERT Only baseline.")
                         model = CodeBERTOnly(device).to(device)
                     else:
-                        print("[MODEL] Using Hybrid (BertRGCN) model.")
+                        if IS_MAIN: print("[MODEL] Using Hybrid (BertRGCN) model.")
                         model = BertRGCN(
                             gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv
                         ).to(device)
+
+                        # 真のクラス分布で分類器バイアスを初期化（初期予測を50/50から実分布へ補正）
+                        if cnt0 > 0 and cnt1 > 0:
+                            pos_rate = cnt1 / (cnt0 + cnt1)
+                            bias_init = math.log(pos_rate / (1.0 - pos_rate))  # ≈ -3.22
+                            with torch.no_grad():
+                                last_linear = model.classifier[-1]
+                                last_linear.bias[0].fill_(0.0)
+                                last_linear.bias[1].fill_(bias_init)
+                            print(f"[BiasInit] classifier bias initialized: [0.0, {bias_init:.3f}]")
+
+                    # Wrap model with DDP when distributed
+                    if args.distributed:
+                        model = torch.nn.parallel.DistributedDataParallel(
+                            model,
+                            device_ids=[args.local_rank],
+                            output_device=args.local_rank,
+                            find_unused_parameters=False,
+                        )
+
                     # --- Optimizer: CodeBERT とそれ以外で lr を分ける ---
                     wd = 5e-4
                     base_lr = lr
@@ -1303,9 +1469,9 @@ if __name__ == '__main__':
                     )
 
                     # --- Scheduler（Warmup + Linear Decay） ---
-                    # ★ サブセットを使っているので effective_samples を使う
+                    # IterableDatasetのため実ステップ数が不確かなので2倍マージンを持たせる
                     steps_per_epoch = math.ceil(effective_samples / batch_size)
-                    total_steps = steps_per_epoch * NUM_EPOCHS
+                    total_steps = steps_per_epoch * NUM_EPOCHS * 2  # 2倍でLR=0到達を遅延
                     warmup_steps = int(0.1 * total_steps)
 
                     if total_steps > 0:
@@ -1354,65 +1520,76 @@ if __name__ == '__main__':
                         # Validate (W&Bログ含む)
                         if val_loader is not None:
                             plot_prefix = f"val_bs{batch_size}_lr{lr_str}_br{ratio_str}_ep{epoch}"
-                            val_loss, acc, prec, rec, f1 = validate(model, val_loader, plot_prefix=plot_prefix)
-                            
+                            validate(model, val_loader, plot_prefix=plot_prefix)
+
+                            # 最適閾値でF1を再計算してearly stoppingに使う
+                            best_t, thresh_stats = search_best_threshold(model, val_loader)
+                            if thresh_stats is not None:
+                                _, t_prec, t_rec, f1_thresh = thresh_stats
+                                print(f"[ThreshF1] t={best_t:.2f} P={t_prec:.4f} R={t_rec:.4f} F1={f1_thresh:.4f}")
+                                wandb.log({"Val/ThreshF1": f1_thresh, "Val/BestThresh": best_t, "Epoch": epoch})
+                                f1 = f1_thresh
+                            else:
+                                f1 = 0.0
+
                             if f1 > best_f1:
                                 best_f1 = f1
                                 wait = 0
-                                torch.save(model.state_dict(), str(SAVE_PATH))
+                                # Only main rank saves checkpoint
+                                if IS_MAIN:
+                                    torch.save(model.state_dict(), str(SAVE_PATH))
                             else:
                                 wait += 1
                                 if wait >= patience:
-                                    print("Early Stopping")
+                                    if IS_MAIN: print("Early Stopping")
                                     break
-                    
+
                     # Run終了
-                    wandb.finish()
-                    
+                    if IS_MAIN:
+                        wandb.finish()
+                    else:
+                        # ensure non-main does not attempt wandb.finish()
+                        pass
 
-    # ------------------------------------------------------------
-    # TEST モード：指定モデルでしきい値サーチ + 評価
-    # ------------------------------------------------------------
-    if args.mode == "test":
-        # test_loader / val_loader を作成（batch_size は context.batch_size を利用）
-        test_loader = make_stream_loader_for_split(
-            "test",
-            batch_size=context.batch_size,
-            buffer_size=max(64, context.batch_size * 4),
-            shuffle=False
-        )
-        val_loader = make_stream_loader_for_split(
-            "valid",
-            batch_size=context.batch_size,
-            buffer_size=max(64, context.batch_size * 4),
-            shuffle=False
-        )
-        if test_loader is None:
-            raise RuntimeError("test split が空です。")
+    # If distributed, synchronize and destroy process group before exiting
+    if args.distributed:
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
-        # SAVE_PATH は単一モデルを指す（従来通り）
-        SAVE_PATH = _resolve_save_path(args.path, filename="bert_rgcn.pth")
+    # モデル読み込み（test モードなどで使用）
+    if args.path and args.path.strip() != "":
+        from models.LMGNN import BertRGCN, CodeBERTOnly
 
+        # モデル初期化ロジック (trainループ内およびtestモード内)
         if args.model_type == 'codebert':
-            from models.LMGNN import CodeBERTOnly
             model_test = CodeBERTOnly(device).to(device)
         else:
-            model_test = BertRGCN(gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv).to(device)
+            model_test = BertRGCN(
+                gated_graph_conv_args, conv_args, emb_size, device, Conv=Conv
+            ).to(device)
 
-        # 以降は共通
-        model_test.load_state_dict(torch.load(str(SAVE_PATH), map_location=device))
+        # ★ 保存モデルのロード
+        state = torch.load(str(args.path), map_location=device)
+        # module. プレフィックスを削る処理（必要なら）
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k[len("module."):]: v for k, v in state.items()}
+        model_test.load_state_dict(state)
 
-        # ① 固定しきい値 0.5
-        loss0, acc0, p0, r0, f10 = evaluate_with_threshold(model_test, test_loader, threshold=0.5)
-        print('Test (thr=0.50): Average loss: {:.4f}, Acc: {:.2f}%, P: {:.2f}%, R: {:.2f}%, F1: {:.2f}%'.format(
-            loss0, acc0*100, p0*100, r0*100, f10*100
-        ))
-
-        # ② Validation でベストしきい値を探索
-        best_t, _ = search_best_threshold(model_test, val_loader)
-
-        # ③ そのしきい値で Test を評価
-        loss, acc, p, r, f1 = evaluate_with_threshold(model_test, test_loader, threshold=best_t)
-        print('Test (best thr={:.2f} from Val): Average loss: {:.4f}, Acc: {:.2f}%, P: {:.2f}%, R: {:.2f}%, F1: {:.2f}%'.format(
-            best_t, loss, acc*100, p*100, r*100, f1*100
-        ))
+        # テスト実行（結果表示）
+        test_loader = make_stream_loader_for_split(
+            "test",
+            batch_size=32,
+            buffer_size=128,
+            shuffle=False,
+        )
+        if test_loader is not None:
+            print("[TEST] start")
+            test(model_test, test_loader, plot_prefix="test")
+        else:
+            print("[WARN] test split が空です。")

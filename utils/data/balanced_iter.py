@@ -44,3 +44,11 @@ class BalancedBatcher:
         # DataLoader の collate に任せたいので、(gs, ys) に分解
         gs, ys = zip(*batch)
         return gs, ys
+
+# 変更案: Ranked partition を追加 (分散時は各プロセスが別部分を担当)
+def get_ranked_indices(dataset_len, rank, world_size):
+    # simple split by block
+    per = (dataset_len + world_size - 1) // world_size
+    start = rank * per
+    end = min(start + per, dataset_len)
+    return range(start, end)

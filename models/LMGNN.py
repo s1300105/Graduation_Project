@@ -113,234 +113,276 @@ def sanitize_for_rgcn(d, *, trim_x: bool = True, do_coalesce: bool = True):
 from transformers import AutoTokenizer
 
 
-
 class BertRGCN(nn.Module):
-    def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None):
+    def __init__(
+        self,
+        gated_graph_conv_args,
+        conv_args,
+        emb_size,
+        device,
+        Conv=None,
+        debug_shapes: bool = False,
+        log_wandb: bool = False,
+        wandb_prefix: str = "debug",
+    ):
         super().__init__()
         self.device = device
 
-        hidden_dim   = gated_graph_conv_args.get("out_channels", 200)
-        num_relations = gated_graph_conv_args.get("num_relations", 3)
-        num_layers   = gated_graph_conv_args.get("num_layers", 6)
-        
-        self.hidden_dim = hidden_dim
-        self.code_dim   = emb_size
+        self.num_relations = gated_graph_conv_args.get("num_relations", 3)
+        self.num_layers = gated_graph_conv_args.get("num_layers", 6)
 
-        # --- 1. CodeBERT Encoder ---
-        self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-        self.func_encoder   = CodeBERTEncoder(
-            model_name="microsoft/codebert-base",
-            tune_last_n_layers=2,
-        )
-
-        # --- 2. Pre-GCN Processing (Contextualization) ★追加部分 ---
-        # CodeBERTの次元(768)を GCNの次元(200)に合わせる射影層
-        self.code_proj_pre = nn.Linear(self.func_encoder.hidden_size, hidden_dim)
-        
-        # ノード(Query) が コード(Key/Value) を参照するAttention
-        self.context_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=4,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.context_norm = nn.LayerNorm(hidden_dim)
-
-        # --- 3. R-GCN Layers (Standard) ---
-        self.input_proj = nn.Linear(emb_size, hidden_dim)
-        
-        self.rgcn_layers = nn.ModuleList([
-            RGCNConv(hidden_dim, hidden_dim, num_relations)
-            for _ in range(num_layers)
-        ])
-        self.rgcn_norm = nn.LayerNorm(hidden_dim)
-
-        # --- 4. Post-GCN Fusion (Final Integration) ---
-        self.fusion = GraphCodeFusion(
-            code_dim=self.func_encoder.hidden_size, # 768
-            graph_dim=hidden_dim,
-            proj_dim=hidden_dim,
-            num_heads=4,
-            ffn_hidden_dim=hidden_dim * 4,
-            fusion_out_dim=hidden_dim,
-            dropout=0.1,
-            attn_layers=3,
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 2)
-        )
-
-    def forward(self, data):
-        x          = data.x
-        edge_index = data.edge_index
-        edge_type  = data.edge_type
-
-        # ============================================================
-        # Step 1: CodeBERT Encoding (文脈情報の取得)
-        # ============================================================
-        funcs = getattr(data, "func", None)
-        
-        # バッチサイズ計算
-        if isinstance(data, GeoBatch) and hasattr(data, "ptr") and data.ptr is not None:
-            num_nodes_per_graph = data.ptr[1:] - data.ptr[:-1]
-            batch_idx = torch.arange(num_nodes_per_graph.size(0), device=x.device) \
-                            .repeat_interleave(num_nodes_per_graph)
-            B = num_nodes_per_graph.size(0)
-        else:
-            batch_idx = x.new_zeros(x.size(0), dtype=torch.long)
-            B = 1
-
-        # CodeBERT実行
-        if funcs is None:
-            code_emb = x.new_zeros(B, 1, self.func_encoder.hidden_size)
-            code_mask = None
-        else:
-            if isinstance(funcs, str):
-                funcs = [funcs]
-            enc = self.func_tokenizer(
-                list(funcs),
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-            input_ids      = enc["input_ids"].to(self.device)
-            attention_mask = enc["attention_mask"].to(self.device)
-
-            code_emb = self.func_encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_cls=False,        # [B, L_code, 768]
-            )
-            code_mask = attention_mask   # [B, L_code]
-
-        # ============================================================
-        # Step 2: Contextualized Node Features (ノードへの文脈注入) ★追加部分
-        # ============================================================
-        # ノード特徴量の初期投影
-        h_nodes = self.input_proj(x)  # [Total_Nodes, hidden_dim]
-        
-        # CodeBERT出力をGCN次元に射影: [B, L, 768] -> [B, L, 200]
-        code_emb_proj = self.code_proj_pre(code_emb)
-
-        # ノードをバッチ単位のDense形式に変換: [B, Max_Nodes, 200]
-        h_nodes_dense, node_mask = to_dense_batch(h_nodes, batch_idx)
-
-        # Attention用のマスク準備 (True=無視したい場所)
-        if code_mask is not None:
-            # code_maskは 1=有効, 0=padding なので反転させる
-            key_padding_mask = (code_mask == 0)
-        else:
-            key_padding_mask = None
-
-        # Cross-Attention: Nodes(Q) <- Code(K, V)
-        # 各ノードが、コードのトークン列全体を見に行く
-        attn_out, _ = self.context_attn(
-            query=h_nodes_dense,
-            key=code_emb_proj,
-            value=code_emb_proj,
-            key_padding_mask=key_padding_mask
-        )
-
-        # 残差接続 & Norm (Contextualized Nodes)
-        h_nodes_dense = self.context_norm(h_nodes_dense + attn_out)
-
-        # Dense状態から元のFlatな[Total_Nodes, 200]に戻す
-        h_nodes = h_nodes_dense[node_mask]
-
-        # ============================================================
-        # Step 3: R-GCN (グラフ畳み込み)
-        # ============================================================
-        # コンテキスト化された特徴量(h_nodes)を初期値として開始
-        h = h_nodes 
-        for conv in self.rgcn_layers:
-            h = F.relu(conv(h, edge_index, edge_type))
-        
-        h = self.rgcn_norm(h)
-
-        # ============================================================
-        # Step 4: Final Fusion & Classification
-        # ============================================================
-        # 再度Dense化してFusion層へ
-        graph_dense, graph_mask = to_dense_batch(h, batch_idx)
-
-        # Fusion (code_embは元の768次元のものを使用 -> Fusion内で射影される)
-        graph_repr = self.fusion(
-            code_emb=code_emb,              # [B, L_code, 768]
-            graph_emb=graph_dense,          # [B, L_graph, 200]
-            code_mask=code_mask,            # [B, L_code]
-            graph_mask=graph_mask,          # [B, L_graph]
-        )                                   # -> [B, hidden_dim]
-
-        logits = self.classifier(graph_repr)
-        return logits
-    
-
-# models/LMGNN.py に追加
-
-class CodeBERTOnly(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        self.device = device
-        
-        # CodeBERTエンコーダ (既存と同じ設定)
+        # --- 1) CodeBERT ---
         self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
         self.func_encoder = CodeBERTEncoder(
             model_name="microsoft/codebert-base",
             tune_last_n_layers=2,
         )
-        
-        # CodeBERTの隠れ層サイズ (通常768)
-        self.bert_hidden_size = self.func_encoder.hidden_size
 
-        # 分類器
-        # 元のBertRGCNのclassifier構造に似せていますが、入力次元をCodeBERTに合わせます
+        # === 方針②: モデル内部次元を CodeBERT に統一 ===
+        self.bert_dim = self.func_encoder.hidden_size  # usually 768
+        self.model_dim = self.bert_dim                 # unified model dimension
+        self.node_feat_dim = emb_size                  # original node feature dimension
+
+        # --- 2) Pre-GCN Contextualization (Nodes attend to Code tokens) ---
+        # model_dim == bert_dim, so no projection needed
+        self.code_to_model = nn.Identity()
+
+        self.node_code_attn = nn.MultiheadAttention(
+            embed_dim=self.model_dim,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.node_code_norm = nn.LayerNorm(self.model_dim)
+
+        # --- 3) R-GCN ---
+        # ② CodeBERT部分(768次元)のみ正規化（type_idは整数なので除外）
+        self.node_feat_norm = nn.LayerNorm(self.node_feat_dim - 1)
+        # ① type_id を Embedding で処理、CodeBERT 部分を別途投影して結合
+        self.type_embed     = nn.Embedding(64, 64)
+        self.node_feat_proj = nn.Sequential(          # ③ 2層MLPで表現空間のギャップを吸収
+            nn.Linear(self.node_feat_dim - 1, self.model_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.model_dim),
+            nn.Linear(self.model_dim, self.model_dim),
+        )
+        self.node_combine   = nn.Linear(self.model_dim + 64, self.model_dim)
+        self.node_repr_norm = nn.LayerNorm(self.model_dim)  # ① node_combine 後の正規化
+
+        # ③ コード側逆方向 Cross-Attention（コードがノードを参照）
+        self.code_node_attn = nn.MultiheadAttention(
+            embed_dim=self.model_dim,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.code_node_norm = nn.LayerNorm(self.model_dim)
+
+        self.rgcn_layers = nn.ModuleList([
+            RGCNConv(self.model_dim, self.model_dim, self.num_relations)
+            for _ in range(self.num_layers)
+        ])
+        self.rgcn_norm = nn.LayerNorm(self.model_dim)
+
+        # --- 4) Fusion (Code ↔ Graph) ---
+        self.fusion = GraphCodeFusion(
+            code_dim=self.bert_dim,          # 768
+            graph_dim=self.model_dim,        # 768
+            proj_dim=256,                    # ボトルネック (768→256)
+            num_heads=4,
+            ffn_hidden_dim=256 * 4,          # 1024
+            fusion_out_dim=self.model_dim,   # 出力は768に戻す
+            dropout=0.1,
+            attn_layers=3,
+        )
+
         self.classifier = nn.Sequential(
-            nn.Linear(self.bert_hidden_size, 200), # 一度次元を落とす（元のhidden_dimに合わせる場合）
+            nn.LayerNorm(self.model_dim),           # ② Fusion出力を正規化してから分類
+            nn.Linear(self.model_dim, self.model_dim),
+            nn.GELU(),                              # ReLU → GELU
+            nn.Dropout(0.2),
+            nn.Linear(self.model_dim, 2),
+        )
+
+        self.debug_shapes = debug_shapes
+        self.log_wandb = log_wandb
+        self.wandb_prefix = wandb_prefix
+        self._wandb = None
+        if self.log_wandb:
+            try:
+                import wandb
+                self._wandb = wandb
+            except Exception:
+                self._wandb = None
+
+    def forward(self, data):
+        node_feat = data.x
+        edge_index = data.edge_index
+        edge_type = data.edge_type
+
+        # ------------------------------------------------------------
+        # Step 1) CodeBERT token representations
+        # ------------------------------------------------------------
+        func_texts = getattr(data, "func", None)
+
+        # Determine batch assignment for nodes
+        if isinstance(data, GeoBatch) and hasattr(data, "ptr") and data.ptr is not None:
+            nodes_per_graph = data.ptr[1:] - data.ptr[:-1]
+            batch_index = torch.arange(nodes_per_graph.size(0), device=node_feat.device).repeat_interleave(nodes_per_graph)
+            batch_size = int(nodes_per_graph.size(0))
+        else:
+            batch_index = node_feat.new_zeros(node_feat.size(0), dtype=torch.long)
+            batch_size = 1
+
+        if func_texts is None:
+            code_tok_repr = node_feat.new_zeros(batch_size, 1, self.bert_dim)  # [B, 1, 768]
+            code_tok_mask = None
+        else:
+            if isinstance(func_texts, str):
+                func_texts = [func_texts]
+
+            enc = self.func_tokenizer(
+                list(func_texts),
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+            input_ids = enc["input_ids"].to(self.device)
+            attention_mask = enc["attention_mask"].to(self.device)
+
+            code_tok_repr = self.func_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_cls=False,  # [B, L_code, 768]
+            )
+            code_tok_mask = attention_mask  # [B, L_code] (1=valid, 0=pad)
+
+        # ------------------------------------------------------------
+        # Step 2) Contextualize nodes by attending to code tokens
+        # ------------------------------------------------------------
+        # ① type_id を分離して Embedding、② CodeBERT 部分を LayerNorm してから投影
+        type_ids      = node_feat[:, 0].long().clamp(0, 63)
+        codebert_feat = node_feat[:, 1:]                            # [N, 768]
+        codebert_norm = self.node_feat_norm(codebert_feat)          # ② 正規化
+        type_emb      = self.type_embed(type_ids)                   # ① [N, 64]
+        feat_emb      = self.node_feat_proj(codebert_norm)          # ① [N, 768]
+        node_repr0    = self.node_repr_norm(F.gelu(self.node_combine(
+            torch.cat([feat_emb, type_emb], dim=-1)
+        )))  # [N, 768]
+
+        code_tok_repr_model = self.code_to_model(code_tok_repr)  # Identity: [B, L_code, 768]
+
+        node_repr_dense, node_valid_mask = to_dense_batch(node_repr0, batch_index)  # [B, L_node, 768]
+
+        code_key_padding_mask = (code_tok_mask == 0) if code_tok_mask is not None else None  # True=ignore
+
+        if self.debug_shapes:
+            kp_shape = None if code_key_padding_mask is None else tuple(code_key_padding_mask.shape)
+            print(
+                f"[debug] node_repr_dense={tuple(node_repr_dense.shape)}, "
+                f"code_tok_repr_model={tuple(code_tok_repr_model.shape)}, "
+                f"code_key_padding_mask={kp_shape}"
+            )
+
+        attn_out, _ = self.node_code_attn(
+            query=node_repr_dense,
+            key=code_tok_repr_model,
+            value=code_tok_repr_model,
+            key_padding_mask=code_key_padding_mask,
+        )
+        node_repr_ctx_dense = self.node_code_norm(node_repr_dense + attn_out)
+
+        # Back to flat: [TotalNodes, 768]
+        node_repr_ctx = node_repr_ctx_dense[node_valid_mask]
+
+        # ③ コードがノードを参照（逆方向 Cross-Attention）
+        node_key_padding_mask = ~node_valid_mask  # True=padding 位置を無視
+        # 全ノードがパディングのサンプルがあると全マスク→NaN になるため先頭を強制有効化
+        all_node_masked = node_key_padding_mask.all(dim=1, keepdim=True)
+        safe_node_key_padding_mask = node_key_padding_mask & ~all_node_masked
+        code_attn_out, _ = self.code_node_attn(
+            query=code_tok_repr_model,
+            key=node_repr_dense,
+            value=node_repr_dense,
+            key_padding_mask=safe_node_key_padding_mask,
+        )
+        code_tok_repr = self.code_node_norm(code_tok_repr_model + code_attn_out)
+
+        # ------------------------------------------------------------
+        # Step 3) R-GCN over contextualized node representations
+        # ------------------------------------------------------------
+        node_repr_gcn = node_repr_ctx
+        for rgcn in self.rgcn_layers:
+            node_repr_gcn = F.relu(rgcn(node_repr_gcn, edge_index, edge_type)) + node_repr_gcn
+        node_repr_gcn = self.rgcn_norm(node_repr_gcn)
+
+        # ------------------------------------------------------------
+        # Step 4) Fusion + Classification
+        # ------------------------------------------------------------
+        graph_node_repr_dense, graph_node_mask = to_dense_batch(node_repr_gcn, batch_index)  # [B, L_graph, 768]
+
+        graph_repr = self.fusion(
+            code_emb=code_tok_repr,              # [B, L_code, 768]
+            graph_emb=graph_node_repr_dense,     # [B, L_graph, 768]
+            code_mask=code_tok_mask,             # [B, L_code]
+            graph_mask=graph_node_mask,          # [B, L_graph]
+        )  # [B, model_dim(=768)]
+
+        logits = self.classifier(graph_repr)
+        return logits
+
+    
+
+# models/LMGNN.py に追加
+class CodeBERTOnly(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+
+        self.func_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+        self.func_encoder = CodeBERTEncoder(
+            model_name="microsoft/codebert-base",
+            tune_last_n_layers=2,
+        )
+
+        self.bert_dim = self.func_encoder.hidden_size  # 768
+
+        # 768統一（BertRGCNのclassifier容量と揃える）
+        self.classifier = nn.Sequential(
+            nn.Linear(self.bert_dim, self.bert_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(200, 2)
+            nn.Linear(self.bert_dim, 2),
         )
 
     def forward(self, data):
-        # 1) 関数コードのトークナイズ
-        funcs = getattr(data, "func", None)
-        if funcs is None:
-            # 万が一funcがない場合のダミー (Batchサイズに合わせてゼロ埋め)
-            # data.x からバッチサイズを推定
-            B = data.x.size(0) if hasattr(data, "x") else 1
-            return torch.zeros(B, 2, device=self.device)
+        func_texts = getattr(data, "func", None)
+        if func_texts is None:
+            # 通常ここには来ない前提なら 1 でOK（安全）
+            return torch.zeros(1, 2, device=self.device)
 
-        if isinstance(funcs, str):
-            funcs = [funcs]
+        if isinstance(func_texts, str):
+            func_texts = [func_texts]
 
         enc = self.func_tokenizer(
-            list(funcs),
+            list(func_texts),
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512, 
+            max_length=512,
         )
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
 
-        # 2) CodeBERTでエンコード (return_cls=True で [CLS] トークンのみ取得)
-        # [B, 768]
         cls_emb = self.func_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_cls=True 
+            return_cls=True,   # [B, 768]
         )
 
-        # 3) 分類
         logits = self.classifier(cls_emb)
         return logits
-
-
 
 
 

@@ -200,11 +200,11 @@ class FusionBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_dim, dropout):
         super().__init__()
         # --- 1. Self-Attention ---
-        #self.self_attn_code = AttentionBlock(dim, num_heads, dropout)
-        #self.norm1_code = nn.LayerNorm(dim)
-        
-        #self.self_attn_graph = AttentionBlock(dim, num_heads, dropout)
-        #self.norm1_graph = nn.LayerNorm(dim)
+        self.self_attn_code = AttentionBlock(dim, num_heads, dropout)
+        self.norm1_code = nn.LayerNorm(dim)
+
+        self.self_attn_graph = AttentionBlock(dim, num_heads, dropout)
+        self.norm1_graph = nn.LayerNorm(dim)
 
         # --- 2. Cross-Attention ---
         self.cross_attn_code = AttentionBlock(dim, num_heads, dropout)
@@ -220,14 +220,24 @@ class FusionBlock(nn.Module):
         self.ffn_graph = PositionwiseFFN(dim, ffn_dim, dropout)
         self.norm3_graph = nn.LayerNorm(dim)
 
+    @staticmethod
+    def _safe_mask(mask):
+        """全位置がマスクされている場合、先頭1位置を強制的に有効化してNaNを防ぐ。"""
+        if mask is None:
+            return None
+        all_masked = mask.all(dim=1, keepdim=True)  # [B, 1]
+        return mask & ~all_masked
+
     def forward(self, code, graph, code_padding_mask, graph_padding_mask):
-        # --- 1. Self-Attention ---
+        # --- 1. Self-Attention (NaN対策: 全マスクを防ぐ) ---
+        safe_code_mask = self._safe_mask(code_padding_mask)
+        safe_graph_mask = self._safe_mask(graph_padding_mask)
         # Code
-        #c2 = self.self_attn_code(query=code, key=code, value=code, key_padding_mask=code_padding_mask)
-        #code = self.norm1_code(code + c2)
+        c2 = self.self_attn_code(query=code, key=code, value=code, key_padding_mask=safe_code_mask)
+        code = self.norm1_code(code + c2)
         # Graph
-        #g2 = self.self_attn_graph(query=graph, key=graph, value=graph, key_padding_mask=graph_padding_mask)
-        #graph = self.norm1_graph(graph + g2)
+        g2 = self.self_attn_graph(query=graph, key=graph, value=graph, key_padding_mask=safe_graph_mask)
+        graph = self.norm1_graph(graph + g2)
 
         # --- 2. Cross-Attention ---
         # Code query, Graph key/value (CodeがGraphの情報を取り込む)
@@ -281,7 +291,8 @@ class GraphCodeFusion(nn.Module):
             for _ in range(attn_layers)
         ])
         
-        self.gate_layer = nn.Linear(proj_dim * 2, 2)
+        self.gate_code  = nn.Linear(proj_dim * 2, proj_dim)
+        self.gate_graph = nn.Linear(proj_dim * 2, proj_dim)
 
         # Final Fusion Output
         fused_dim = proj_dim * 2
@@ -334,26 +345,21 @@ class GraphCodeFusion(nn.Module):
 
 
         # 1. まず両方の情報を一度結合して「状況」を把握する
-        combined_features = torch.cat([code_vec, graph_vec], dim=-1)  # [B, 2*D]
-        
-        # 2. ゲート係数（重み）を計算する
-        # Softmaxを使うことで、w_code + w_graph = 1.0 になり、バランス調整という意味合いが強まる
-        gate_logits = self.gate_layer(combined_features)      # [B, 2]
-        gate_weights = F.softmax(gate_logits, dim=-1)         # [B, 2] (確率分布化)
+        combined_features = torch.cat([code_vec, graph_vec], dim=-1)  # [B, 2*proj_dim]
 
-        w_code  = gate_weights[:, 0:1] # [B, 1]
-        w_graph = gate_weights[:, 1:2] # [B, 1]
+        # 2. 次元ごとの独立した sigmoid ゲート (softmax崩壊防止)
+        g_code  = torch.sigmoid(self.gate_code(combined_features))   # [B, proj_dim]
+        g_graph = torch.sigmoid(self.gate_graph(combined_features))  # [B, proj_dim]
 
-        # ★ ここで値を保存する (CPUに移してitem化し、計算グラフを切る)
+        # ★ 訓練中のみ重みを保存
         if self.training:
-            # 訓練中のみ保存（推論時は無駄な処理を省くため）
             self.last_weights = {
-                "code": w_code.mean().item(),
-                "graph": w_graph.mean().item()
+                "code": g_code.mean().item(),
+                "graph": g_graph.mean().item()
             }
 
-        # 3. 重み付き結合
-        fused = torch.cat([w_code * code_vec, w_graph * graph_vec], dim=-1)
+        # 3. 次元ごとの重み付き結合
+        fused = torch.cat([g_code * code_vec, g_graph * graph_vec], dim=-1)
 
         # === 変更終了 ===
 
