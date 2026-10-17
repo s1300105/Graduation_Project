@@ -1,0 +1,1526 @@
+{
+ "finder": "merger",
+ "summary": "67 raw findings from 7 finders were merged into 46 findings. Merges: focal-loss bug [trainloop-01, data-01, dynamics-3]; single-run/noise [trainloop-03, data-06, dynamics-5, literature-4]; grid search on pre-gate model [trainloop-04, data-02, dynamics-7, provenance-06]; HEAD selection criterion change [trainloop-05, provenance-09]; protocol constants unpinned [trainloop-06, model-09, data-05]; gate non-identifiability [model-05, dynamics-1]; gate collapse [model-06, dynamics-2]; os.chdir/pyvis [model-08, provenance-02]; node-feature redundancy [graph-04, literature-2, data-10]; BigVul label noise [data-04, literature-3]; checkpoint selection/threshold moot [data-07, dynamics-4]; under-trained baseline vs literature [literature-5, data-08]; depth ablation flat but pre-gate [dynamics-6, provenance-08]; Figure 2 unreproducible [provenance-01, dynamics-8]. All other raw findings kept as distinct. No raw finding was excluded entirely as unsupported speculation; parts within findings that are speculative are marked as such in the claims: trainloop-08's assertion that OOM skipping affected Table 1 (no evidence it fired, kept at confidence 0.3), data-03's claim that the 1200-char filter halves the positive rate (unverifiable without data), trainloop-02/data-02/trainloop-01's suggestion that the hybrid is differentially harmed by the stream/loss defects (no measurement), and dynamics-3's 'no renormalisation' mechanism (superseded by trainloop-01's computation showing plain weighted CE gives a 1:1 gradient share; the 4.2:1 imbalance comes from alpha being exponentiated into p_t). One severity judgement: provenance-02 (hard-coded os.chdir) was reported critical; merged as major because it is a two-line path error that blocks import but changes no number. Overall picture for the user's question: confirmed code bugs that specifically cripple the graph branch (edge-type labelling, <global> duplicates, C++-as-C stubs, un-normalised features) coexist with design choices that make the graph branch redundant by construction (frozen CLS of the same text, 1200-char filter) and a measurement too coarse (one unseeded run per arm, 1.9-point gap) to say the hybrid is worse at all; the thesis's Figure 2 interpretation is not supported by the architecture or by the repo's own replicate runs.",
+ "findings": [
+  {
+   "id": "M01",
+   "title": "FocalLoss applies the class weight inside cross_entropy before computing p_t: the trained loss is -w_t(1-p_t^{w_t})^2 log p_t, removing focal damping for positives, over-damping negatives, and starting every focal-era run in an all-positive regime",
+   "category": "bug",
+   "severity": "critical",
+   "claim": "[trainloop-01, data-01, dynamics-3] In both thesis-era and HEAD FocalLoss.forward, ce = F.cross_entropy(..., weight=alpha, reduction='none') and pt = exp(-ce), so pt = p_t^{alpha_t}, not p_t. With alpha = 0.5/freq (w1 ≈ 16.7, w0 ≈ 0.516 at ~3% positives), a positive's modulating factor (1-p^16.7)^2 stays ≥ 0.68 up to p = 0.9 (thesis eq. 12: 0.01), i.e. 4x-240x the intended loss; a negative's factor is 0.27-0.36x the intended one. Per-batch gradient share at initialisation is 4.2:1 positives:negatives, versus 1:1 under the correct focal loss or plain weighted CE. Every focal-era 200-epoch run (plots_Elevneth, plots_12, plots_codebert_first) starts with val recall 1.0 / precision ~0.035 / F1 0.07 and needs ~25-30 epochs to reach F1 0.3; weighted-CE-era runs (both sweeps, bigvul_attn1/3/5) show no such regime (recall starts 0.03-0.4, train loss starts ~0.6 vs ~0.3). plots_selfatention never left the regime. The criterion object is shared by both arms, so this lowers both rather than biasing the comparison; §4.3's description is not what was trained.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "66-68",
+     "quote": "ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)\n        pt = torch.exp(-ce_loss)  # pt = p (正解クラスの確率)\n        focal_loss = ((1 - pt) ** self.gamma) * ce_loss"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "86-88",
+     "quote": "ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)\n        pt = torch.exp(-ce_loss)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "1016-1028",
+     "quote": "w0 = 0.5 / freq0 ... w1 = 0.5 / freq1 ... criterion = FocalLoss(alpha=class_weights, gamma=2.0).to(device)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/trainloop/focal_check2.py",
+     "lines": "output",
+     "quote": "y=1 p=0.90: code factor 0.68437 vs thesis 0.01000 (68.44x); y=0 p=0.90: 0.00279 vs 0.01000 (0.28x); batch gradient share pos:neg code 4.16:1, thesis eq.12 1.00:1, weighted CE 1.00:1"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_Elevneth/training_metrics_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "ep1: Recall 1.0, Precision ~0.035, F1 ~0.07; Recall >= 0.9 until ~ep9; same start in plots_codebert_first and plots_12"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_bigvul_attn3/training_metrics_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "same bs16/lr1e-4/br0.3 under weighted CE: Recall starts 0.03, Precision 0.12, no all-positive regime"
+    }
+   ],
+   "mechanism": "Exponentiating the class weight into p_t makes every positive a 'hard' example regardless of how well it is classified while suppressing negatives, so the cheapest descent direction at initialisation is to push all logits toward class 1; the model then spends ~25-30 of 200 epochs recovering, probabilities are biased toward the positive class (which the val-tuned threshold must undo), per-batch gradients are dominated by whichever positive is present (bs16, ~0.5 positives per batch), and with patience 5 (CLI default and sweep setting) a run would be stopped before learning. Shared criterion: symmetric between arms. The hybrid trains its softmax gate during this degenerate phase and plots_selfatention shows a permanent collapse that a gate-less baseline cannot suffer, so a differential effect on the hybrid is plausible but not measured.",
+   "hurts": [
+    "both",
+    "thesis_text"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "Run /tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/trainloop/focal_check2.py; or for logits z and alpha=[0.516,16.7] compare exp(-F.cross_entropy(z,y,weight=alpha,reduction='none')) with softmax(z)[y]**alpha[y]. Compare val_p1_hist ep1 across plots_Elevneth / plots_12 / plots_codebert_first (all unimodal >= 0.5) with any sweep run. Retrain one epoch with the corrected loss and check epoch-1 recall is no longer 1.0.",
+   "suggested_fix": "logp = F.log_softmax(inputs,-1).gather(1,targets[:,None]).squeeze(1); p = logp.exp(); loss = -(alpha[targets] * (1-p)**gamma * logp); normalise by alpha[targets].sum() or cap alpha_pos at 3-5; optionally initialise the classifier bias to log(prior). Re-run both arms."
+  },
+  {
+   "id": "M02",
+   "title": "The training stream is bit-identical every epoch (RNG re-seeded with 42+pid inside __iter__, shuffle only within 128-item windows of a sorted file list) and the default --subset_frac 0.10 trains on a fixed 10% prefix",
+   "category": "bug",
+   "severity": "major",
+   "claim": "[trainloop-02] StreamGraphDataset sorts the file list and creates random.Random(42 + os.getpid()) at the start of every __iter__ call, shuffling only within consecutive buffers of max(128, 8*bs) = 128 items at bs16, so every epoch yields the same examples in the same order in the same minibatches. LimitedStreamDataset stops after int(0.1*N) items, so with the default flag 90% of training functions are never seen. Subset membership is fixed across processes except the last partial window, so both arms train on the same subset. Whether the Table 1 runs passed --no_subset is not recorded (see M07).",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "612, 617",
+     "quote": "self.files = list(sorted(files)) ... rng = random.Random(42 + (os.getpid() if hasattr(os, \"getpid\") else 0))"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "663, 905, 1042, 1090",
+     "quote": "if i >= self.max_samples: ... default=0.10, ... effective_samples = int(total_samples_raw * frac) ... max_samples=effective_samples,  # ★ ここがポイント"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "829",
+     "quote": "rng = random.Random(42 + (os.getpid() if hasattr(os, \"getpid\") else 0))"
+    },
+    {
+     "file": "/home/user/Graduation_Project/README.md",
+     "lines": "294",
+     "quote": "python run.py -mode train ... --patience 30 --no_subset --dataset bigvul"
+    }
+   ],
+   "mechanism": "Identical minibatch sequences remove SGD's batch-recomposition noise and turn 200 epochs into 200 repetitions of one gradient sequence (modulo dropout), favouring memorisation (train loss -> ~0 by epoch ~50 while val loss plateaus, F3). If the 10% default was left on, 'trained on BigVul' is really 'trained on a fixed random 10% of BigVul train' (the prefix is random, not label-biased, because CPG_generator shuffles with seed 42; class weights counted on all train files remain appropriate). Both arms share the loader, so this lowers both; a differential effect on the arm with more fresh parameters (hybrid) is plausible but unmeasured.",
+   "hurts": [
+    "both"
+   ],
+   "bears_on": "code",
+   "confidence": 0.85,
+   "how_to_verify": "ds = StreamGraphDataset(files, buffer_size=128, shuffle=True); assert [int(g.y) for g in ds] == [int(g.y) for g in ds]. For the subset question look for the '[Subset] ...' stdout line or W&B config of the final runs; the repo does not record it.",
+   "suggested_fix": "Seed once per process and pass an epoch-dependent seed into __iter__; shuffle the file list per epoch with a buffer of thousands or a precomputed permutation; make full data the default and log the subset flag and effective sample count into the run name."
+  },
+  {
+   "id": "M03",
+   "title": "Table 1 compares one unseeded run per arm; the repo's own identical-hyper-parameter replicates differ by ~2 F1 points, published seed std is 2.8-7.3, and the baseline run's curve is indistinguishable from the hybrid's, so the 1.89-point gap is within noise",
+   "category": "methodology",
+   "severity": "critical",
+   "claim": "[trainloop-03, data-06, dynamics-5, literature-4] run.py never sets a seed (the only seed is torch.manual_seed(2020) at import in models/layers.py; CUDA nondeterminism and pid-dependent data order are uncontrolled). Each arm was trained once at bs16/lr1e-4/ratio0.30 for 200 epochs: plots_Elevneth is the hybrid (Figure 2) and plots_codebert_first the CodeBERTOnly run (its weights_curve is flat at exactly 0.0, which train() writes only for a model without .fusion). Two hybrid runs with identical hyper-parameters (plots_Elevneth vs plots_12) end at val F1@0.5 ~0.42 vs ~0.44 with qualitatively different gate dynamics (F2); plots_codebert_first ends ~0.45, still rising, with the same all-positive start, plateau level and probability polarisation as the hybrid runs. Steenhoek et al. (ICSE 2023) measured 3-seed test-F1 std of 2.78 (CodeBERT), 3.46 (LineVul), 7.33 (ReGVD), 2.9 on average, with 95% of measurements within +/-5.8 points; binomial variability on ~500 test positives alone gives roughly +/-2 F1 at P~R~0.45. The thesis mentions no seeds, repeats or intervals.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "grep manual_seed|seed_everything|np.random.seed",
+     "quote": "(no match in run.py, HEAD or thesis-era); models/layers.py:12 torch.manual_seed(2020)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_codebert_first/weights_curve_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "both gate curves exactly 0.0 for 200 epochs; thesis-era run.py:386-392 'else: total_w_code += 0.0' for models without fusion.last_weights"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_12/training_metrics_bs16_lr1e-04_br0p30.png and plots_Elevneth/training_metrics_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "Val F1 plateau ~0.43-0.44 (plots_12) vs ~0.42 (Elevneth) from ep~125 to 200, same hyper-parameters; plots_codebert_first ~0.44-0.45 at ep200, still rising"
+    },
+    {
+     "file": "https://arxiv.org/abs/2212.08109 (steenhoek2023.txt)",
+     "lines": "147-167",
+     "quote": "standard deviation of 2.9 on average ... LineVul 3.46 / CodeBERT 2.78 / ReGVD 7.33 ... 95% of performance measurements within 5.8% above or below the mean"
+    },
+    {
+     "file": "thesis §5.1 Table 1",
+     "lines": "p.6",
+     "quote": "CodeBERT 52.26% 40.66% 45.74% / Proposed (Hybrid) 48.33% 40.13% 43.85%"
+    }
+   ],
+   "mechanism": "Two draws from distributions with std ~3 points differ by 1.9 points about half the time regardless of which mean is higher; the thesis's conclusions (§5.1 'falls slightly short', §6 'optimisation difficulties', 'structural information not effective enough') rest on a difference not distinguishable from noise. The visible dynamics of the baseline run match the hybrid's in every respect, which is what one expects if the graph branch contributes no signal: the evidence supports 'no measurable gain', not 'hybrid is worse'. This bears on neither code nor idea: the measurement cannot attribute.",
+   "hurts": [
+    "comparison_validity",
+    "thesis_text"
+   ],
+   "bears_on": "neither",
+   "confidence": 0.9,
+   "how_to_verify": "grep -rn manual_seed run.py (empty); view the three training_metrics PNGs side by side; re-run each arm with 3-5 seeds (torch/numpy/random plus a per-seed buffer-shuffle seed) and report mean +/- sd and a paired bootstrap CI on test F1 at tau*.",
+   "suggested_fix": "Seed explicitly; >= 3 seeds per arm; mean +/- sd and paired CI in Table 1; rewrite §5.1/§6 as 'no significant difference' unless the seeded result says otherwise; add graph-only and random-edge ablations."
+  },
+  {
+   "id": "M04",
+   "title": "The §4.4 grid search exists only as two 36-config sweeps run on a 10% subset with patience 5 under weighted CE on a pre-gate hybrid (before f633e44, when CodeBERTOnly did not exist); its ranking was noise-level and neither final arm was tuned",
+   "category": "methodology",
+   "severity": "major",
+   "claim": "[trainloop-04, data-02, dynamics-7, provenance-06] Both sweep directories (plots_patience5_subsetfrac0.1_dataset_bigvul, plots_patience=5_dataset=10%) contain 36 loss/metrics/acc curves and zero weights_curve files, whereas every f633e44-era run writes weights_curve unconditionally (plots_codebert_first has one); git log -S shows weights_curve, class CodeBERTOnly, FocalLoss and the gate first appear in f633e44 (2026-01-13), and cf89c07/034c4bb used CrossEntropyLoss(weight=...) with attn_layers=1 and no gate. Sweep loss curves start at train ~0.6 / val ~0.4 (weighted-CE signature). Per-config runs last 10-45 epochs (patience-5 stops). In sweep 1 every viewed config tops out at val F1@0.5 ~0.13-0.18 (README's own SWEEP SUMMARY: best_f1 0.1848); in sweep 2 configs reach 0.33-0.41 and bs8/lr5e-5/ratio0.2 (0.41) beats the chosen bs16/lr1e-4/ratio0.3 (0.36); the student's later depth ablation used bs8/lr5e-5/0.2. The thesis presents this as a comprehensive search that determined the reported configuration (patience 50, focal loss, 200 epochs) and §5.1 says the baseline used the same setup. The baseline never had its own sweep [see also data-08 in M31].",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/plots_patience5_subsetfrac0.1_dataset_bigvul",
+     "lines": "ls",
+     "quote": "36 loss_curve / 36 training_acc / 36 training_metrics / 857 confusion_matrix / 0 weights_curve; bs16_lr1e-04_br0p30 max_epoch=23, bs32_lr5e-05_br0p30 max_epoch=45"
+    },
+    {
+     "file": "/home/user/Graduation_Project (git)",
+     "lines": "git log -S / git show",
+     "quote": "weights_curve, class CodeBERTOnly, FocalLoss, 'class FusionBlock', last_weights: f633e44 2026-01-13; 034c4bb:run.py:964 criterion = torch.nn.CrossEntropyLoss(weight=class_weights); 034c4bb:models/LMGNN.py attn_layers=1, no gate"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_patience=5_dataset=10%/training_metrics_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "Val F1 0.25 -> 0.33-0.36 over 16 epochs; bs8_lr5e-05_br0p20 reaches 0.41"
+    },
+    {
+     "file": "/home/user/Graduation_Project/README.md",
+     "lines": "48-49",
+     "quote": "===== SWEEP SUMMARY (sorted by best_f1) ===== batch=16, lr=0.0001, best_f1=0.1848 (epoch 12)"
+    },
+    {
+     "file": "thesis §4.4",
+     "lines": "p.5",
+     "quote": "we performed a comprehensive grid search on the validation set ... halted if the validation F1-score did not improve for 50 consecutive epochs"
+    }
+   ],
+   "mechanism": "Hyper-parameters were chosen where candidates were indistinguishable (a few hundredths of F1 after patience-5 stops on a fixed 10% prefix), for a different loss and architecture, then frozen into both final models. base_lr 1e-4 is the top of the grid; for the baseline that group is only a 2-layer head (insensitive), for the hybrid it drives the whole R-GCN + fusion + gate stack. Not a bias toward the baseline (the grid belongs to the hybrid lineage), but §4.4 does not describe what was done for either reported model and neither number is a tuned number; the two sweeps disagreeing ~2.5x on the same nominal data also shows the regime was unstable.",
+   "hurts": [
+    "comparison_validity",
+    "thesis_text"
+   ],
+   "bears_on": "both",
+   "confidence": 0.8,
+   "how_to_verify": "for d in plots_patience5_subsetfrac0.1_dataset_bigvul 'plots_patience=5_dataset=10%'; do ls \"$d\" | grep -c weights_curve; done (0); git show cf89c07:run.py | grep -c weights_curve (0); git show f633e44:run.py | grep -c weights_curve (>0); git show 034c4bb:run.py | sed -n 960,970p; compare sweep loss-curve initial train loss (~0.6) with plots_Elevneth (~0.3).",
+   "suggested_fix": "Re-run at least lr x ratio for each final arm separately under the final loss, full data and patience >= 10; report both sweep tables; otherwise present (16, 1e-4, 0.3) as a chosen rather than an optimal configuration."
+  },
+  {
+   "id": "M05",
+   "title": "HEAD's training loop no longer implements the §4.2/§4.4 protocol: checkpoint selection switched from threshold-tuned val F1 (thesis-era) to F1@0.5, and validate() double-counts",
+   "category": "thesis_code_mismatch",
+   "severity": "major",
+   "claim": "[trainloop-05, provenance-09] Thesis-era (f633e44) runs search_best_threshold on validation each epoch (19 thresholds 0.05..0.95) and early-stops/saves on f1_for_es = tuned F1 with a +1e-4 margin, the same quantity reported at test, consistent with §4.2. HEAD (72d02e9/a7122a4) drops the per-epoch search, selects on F1@0.5 with a strict >, and extends y_true/y_pred twice per batch (F7; ratios unchanged, counts doubled). The thesis's patience 50 appears nowhere in code or artefacts (CLI default 5, README 30, sweep dirs patience5) (see M07). The curve-plotting code that produced Figure 2 is gone at HEAD (see M35).",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "1221-1239",
+     "quote": "best_t, best_stats = search_best_threshold(model, val_loader, num_steps=19) ... f1_for_es = f1_t        # EarlyStopping 用 ... if f1_for_es > best_f1 + 1e-4: ... torch.save(model.state_dict(), str(SAVE_PATH))"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "1414-1417",
+     "quote": "if f1 > best_f1: ... torch.save(model.state_dict(), str(SAVE_PATH))"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "569-576",
+     "quote": "y_true.extend(batch.y.cpu().tolist()) ... y_true.extend(y_true_batch)\n            y_pred_labels.extend(y_pred_batch)"
+    },
+    {
+     "file": "/home/user/Graduation_Project (git)",
+     "lines": "git log -S'f1_for_es' / -S'y_true.extend(y_true_batch)'",
+     "quote": "f1_for_es added 40a168c 2025-11-15, removed 72d02e9 2026-02-17; double extend introduced 72d02e9"
+    }
+   ],
+   "mechanism": "For a model that over-predicts positives early (M01), F1@0.5 and F1@tau* peak at different epochs, so HEAD selects a different checkpoint than the protocol the thesis reports; anyone reproducing from HEAD gets different model selection and doubled W&B confusion counts. Applies to both arms equally: a reproducibility/provenance problem, not a bias.",
+   "hurts": [
+    "reproducibility",
+    "thesis_text"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "cd /home/user/Graduation_Project && git diff f633e44 HEAD -- run.py | grep -n 'f1_for_es\\|search_best_threshold\\|y_true.extend'.",
+   "suggested_fix": "Restore the thesis-era selection block (or state in the thesis that selection uses F1@0.5); delete the second pair of extend calls; tag the commit that produced Table 1."
+  },
+  {
+   "id": "M06",
+   "title": "HEAD cannot train the CodeBERT-only baseline: w_c/w_g are referenced in wandb.log but bound only when model.fusion exists (UnboundLocalError, not caught by the RuntimeError handler)",
+   "category": "bug",
+   "severity": "major",
+   "claim": "[provenance-04; also the NameError part of trainloop-05] In HEAD train(), w_c and w_g are assigned only inside `if hasattr(model, 'fusion') ...`; the unconditional wandb.log at run.py:488-493 reads them, so CodeBERTOnly (no .fusion attribute) raises UnboundLocalError on the first batch; the surrounding `except RuntimeError` does not catch it. Thesis-era code has no such reference, so the baseline row was trainable then.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "474-493",
+     "quote": "if hasattr(model, \"fusion\") and hasattr(model.fusion, \"last_weights\"):\n    w_c = model.fusion.last_weights[\"code\"] ... wandb.log({ ... \"Weights/Code\": w_c, \"Weights/Graph\": w_g })"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "499",
+     "quote": "except RuntimeError as e:"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/provenance/sim_nameerror.py",
+     "lines": "output",
+     "quote": "HybridStub -> ok ; CodeBERTOnlyStub -> UNCAUGHT UnboundLocalError cannot access local variable 'w_c'"
+    }
+   ],
+   "mechanism": "With HEAD, `--model_type codebert` aborts at epoch 1 batch 1, so the Table 1 baseline is reproducible only from thesis-era code (see M38 for its only trace).",
+   "hurts": [
+    "baseline",
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.98,
+   "how_to_verify": "sed -n 470,500p run.py; python3 -I /tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/provenance/sim_nameerror.py; or run HEAD with --model_type codebert on a toy *_input.pkl.",
+   "suggested_fix": "Initialise w_c = w_g = 0.0 before the if, or log the weights only inside the hybrid branch."
+  },
+  {
+   "id": "M07",
+   "title": "Training protocol constants are unpinned and contradict §4.4: patience 50 (thesis) vs 5 (CLI default) / 10 (configs.json, unused) / 30 (README); epochs 100 in thesis-era configs vs 200 in the runs; weight decay 5e-4 hard-coded and unreported; 20-epoch warmup unstated; subset flag unrecorded",
+   "category": "reproducibility",
+   "severity": "major",
+   "claim": "[trainloop-06, model-09, data-05] patience is read only from --patience (default 5; configs.json's patience 10, weight_decay 1.3e-6 and learning_rate are never read); wd = 5e-4 is hard-coded for all parameters including LayerNorm/bias; warmup = 10% of ceil(N/bs)*NUM_EPOCHS steps = 20 epochs with linear decay to 0; NUM_EPOCHS comes from configs.json (100 in the thesis-era snapshot, 200 at HEAD, no CLI flag); --subset_frac defaults to 0.10 (M02). The README's only BigVul command uses --patience 30 --no_subset; sweep dirs record patience 5; plots_bigvul_attn1 (41 epochs) and plots_selfatention (40) cannot have used patience 50 (shortest possible run 51). The three 200-epoch runs carry no record of patience or subset, and nothing distinguishes full-data from 10%-subset training; plots_selfatention implies a self-attention variant that exists only as commented-out code. Both model types save to bert_rgcn_bs{bs}_lr{lr}_br{ratio}.pth in the same directory (see M37).",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "925, 1073-1074, 1127, 1156-1158",
+     "quote": "default=5, ... patience = max(1, args.patience)\n        NUM_EPOCHS = context.epochs ... wd = 5e-4 ... total_steps = steps_per_epoch * NUM_EPOCHS\n                    warmup_steps = int(0.1 * total_steps)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/configs.json",
+     "lines": "41-42",
+     "quote": "\"epochs\" : 100,\n        \"patience\" : 10,"
+    },
+    {
+     "file": "/home/user/Graduation_Project/README.md",
+     "lines": "103-104, 294",
+     "quote": "デフォルトは 5 epoch ... --patience 30 --no_subset --dataset bigvul"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_bigvul_attn1 and plots_selfatention",
+     "lines": "confusion_matrix_*_ep*.png",
+     "quote": "max_epoch=41 ; max_epoch=40"
+    },
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "203-207",
+     "quote": "#self.self_attn_code = AttentionBlock(dim, num_heads, dropout) ..."
+    }
+   ],
+   "mechanism": "Stopping rule, warmup, decay and data fraction change which checkpoint is selected and what was trained on; if the 10% default was left on, both arms were trained for 200 epochs on the same ~10% prefix in the same order (memorisation of a few hundred positives). wd 5e-4 under AdamW is negligible (lr*wd = 5e-8 per step). None of this biases one arm, but the headline numbers cannot be reproduced from thesis plus repo.",
+   "hurts": [
+    "reproducibility",
+    "thesis_text",
+    "both"
+   ],
+   "bears_on": "code",
+   "confidence": 0.85,
+   "how_to_verify": "grep -n 'context.patience' run.py (no use); grep -n -- '--epochs' run.py (none); ls plots_bigvul_attn1 | grep -c confusion (41); look for '[Subset]' / '[EarlyStopping] patience=' / '[SCHED]' lines in the student's logs or W&B config.",
+   "suggested_fix": "Record the exact command line, patience, subset flag, warmup fraction and weight decay in the thesis and in the run name/W&B config; make --no_subset the default; set configs.json defaults to the thesis values or delete the unused keys."
+  },
+  {
+   "id": "M08",
+   "title": "No gradient clipping, and every freshly initialised hybrid module (input_proj, 6 R-GCN layers, 3 fusion blocks, gate, classifier) trains at base_lr 1e-4 (top of the grid) while the baseline's only fresh module is a 2-layer head",
+   "category": "design_choice",
+   "severity": "major",
+   "claim": "[trainloop-07] The optimiser puts every parameter whose name lacks 'func_encoder.bert' into the base_lr group and neither code version calls clip_grad_norm_. For CodeBERTOnly that group is Linear(768,200)+Linear(200,2); for BertRGCN it is the whole randomly initialised R-GCN + cross-attention + softmax gate stack. F2 records a hybrid run whose gate alternates between ~0/1 and ~1/0 for 200 epochs (plots_12) and one whose gate collapsed at epoch 11 (plots_selfatention). Confidence is moderate: the link between lr/clipping and the observed instability is inferred, not measured.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "1127-1146",
+     "quote": "base_lr = lr\n                    bert_lr = lr * bert_ratio ... if \"func_encoder.bert\" in name: ... param_groups.append({\"params\": non_bert_params, \"lr\": base_lr})"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "grep -c clip_grad",
+     "quote": "0 (also 0 in HEAD run.py)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "128-160, 254-259",
+     "quote": "self.input_proj = nn.Linear(emb_size, hidden_dim) ... RGCNConv(...) for _ in range(num_layers) ... GraphCodeFusion(... attn_layers=3) ... [baseline] nn.Linear(self.bert_hidden_size, 200), ... nn.Linear(200, 2)"
+    }
+   ],
+   "mechanism": "AdamW at 1e-4 without clipping on a 2-way softmax gate fed by fresh cross-attention stacks lets the gate saturate; once saturated toward the untrained graph branch the classifier receives almost no CodeBERT signal (plots_selfatention F1 0.07). The baseline has no component that can fail this way. This is the concrete form of the 'optimisation difficulties' the thesis hypothesises in §6, so it bears on both the implementation and the idea's trainability as specified. Related to M15.",
+   "hurts": [
+    "hybrid"
+   ],
+   "bears_on": "both",
+   "confidence": 0.5,
+   "how_to_verify": "Log model.fusion.last_weights and the global grad norm per step for a hybrid run; rerun with clip_grad_norm_(1.0) and a third param group for fusion/gate at <= 3e-5 across 3 seeds.",
+   "suggested_fix": "Clip gradients at 1.0; give fusion/gate their own lower lr; initialise the gate near 0.5/0.5; consider warm-starting the R-GCN branch before enabling the gate."
+  },
+  {
+   "id": "M09",
+   "title": "CUDA-OOM batches are silently skipped (continue) with no counter and without stepping the scheduler; only the heavier hybrid is likely to trigger it, and the dropped batches would be the largest graphs",
+   "category": "design_choice",
+   "severity": "minor",
+   "claim": "[trainloop-08] train() catches RuntimeError containing 'out of memory', prints a warning and continues; n_batches and the scheduler are not advanced and nothing records how many batches were skipped. validate()/test() have no such guard. There is no evidence in the repo that it fired; a rough memory estimate suggests bs16 fits a 24 GB RTX 3090, so the impact on Table 1 is speculative (low confidence).",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "402-407",
+     "quote": "except RuntimeError as e:\n            if \"out of memory\" in str(e).lower():\n                print(f\"[WARN] CUDA OOM at step {batch_idx+1}. Skipping.\") ... continue"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "499-504",
+     "quote": "if \"out of memory\" in str(e).lower(): ... continue"
+    }
+   ],
+   "mechanism": "If it fired, the hybrid trained on fewer and systematically shorter samples than the baseline for the same nominal data, an asymmetric and invisible data loss.",
+   "hurts": [
+    "hybrid",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.3,
+   "how_to_verify": "grep the training stdout / W&B logs of the final runs for '[WARN] CUDA OOM'; add a skipped-batch counter and rerun one hybrid epoch at bs16.",
+   "suggested_fix": "Count and log skipped batches per epoch and fail above a small threshold; step the scheduler on skip; or drop/split over-size graphs deterministically for both arms."
+  },
+  {
+   "id": "M10",
+   "title": "Thesis-era model matches §3.4-3.5 except node-feature width (769 not 768), classifier depth, and unreported hyper-parameters (6 R-GCN layers, 3 fusion layers, FFN 800, 4 heads, dropout, max_length 512)",
+   "category": "thesis_code_mismatch",
+   "severity": "minor",
+   "claim": "[model-01] The thesis-era BertRGCN/GraphCodeFusion implement the stated R-GCN (d_g=200, LN after last layer), projection (d_proj=200), bidirectional post-LN cross-attention + FFN, masked mean pooling, softmax gate and weighted concat; mismatches: (i) node init is 769-d [type_id, CLS] with node code truncated to 128 tokens; (ii) 'final FFN followed by a linear classifier' is FFN(no residual)->LN->Linear(400->200)->2-layer MLP; (iii) six R-GCN layers, three fusion layers, FFN 800, 4 heads, dropout 0.1, max_length 512, weight decay 5e-4 and the trainable-but-unused pooler are unstated. configs.json aggr='add' is never passed to RGCNConv, so the actual aggregation is PyG's default mean, which matches Eq. (3).",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "121-160",
+     "quote": "hidden_dim = gated_graph_conv_args.get(\"out_channels\", 200) ... self.rgcn_norm = nn.LayerNorm(hidden_dim) ... proj_dim=hidden_dim, num_heads=4, ffn_hidden_dim=hidden_dim * 4, ... attn_layers=3, ... self.classifier = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(0.2), nn.Linear(hidden_dim, 2))"
+    },
+    {
+     "file": "/home/user/Graduation_Project/utils/process/embeddings.py",
+     "lines": "47-64",
+     "quote": "max_len: int = 128, ... # 出力形状: [type_id(1) + 768] = 769"
+    },
+    {
+     "file": "/home/user/Graduation_Project/configs.json",
+     "lines": "7",
+     "quote": "\"gated_graph_conv_args\": {\"out_channels\" : 200, \"num_layers\" : 6, \"aggr\" : \"add\", \"bias\": true}"
+    }
+   ],
+   "mechanism": "None of these change the numbers materially; they matter for a reader rebuilding the model from the text.",
+   "hurts": [
+    "thesis_text"
+   ],
+   "bears_on": "code",
+   "confidence": 0.95,
+   "how_to_verify": "Instantiate thesis-era BertRGCN with configs.json and print(model); check rgcn_layers[0].aggr == 'mean', len(fusion.layers)==3, and x width 769 from nodes_to_input.",
+   "suggested_fix": "State the 769-d input, 6 R-GCN layers, 3 fusion layers, FFN width, heads, dropout, extra head layers, weight decay and max_length in §3."
+  },
+  {
+   "id": "M11",
+   "title": "HEAD implements a different model from the thesis: hidden size forced to 768, pre-GCN node->token attention, 72M from-scratch parameters vs 5M",
+   "category": "reproducibility",
+   "severity": "major",
+   "claim": "[model-02] HEAD (a7122a4) overrides the configured hidden_dim=200 with CodeBERT's 768 and inserts a MultiheadAttention + LayerNorm in which every node attends to all CodeBERT tokens before the R-GCN. Measured trainable-from-scratch parameters: thesis-era 4,968,804 vs HEAD 72,046,084 (fusion 54.3M, R-GCN 14.2M, context_attn 2.4M). The thesis (§3.4.1 d_g=200, §3.5.1 d_proj=200, no pre-GCN attention) describes the thesis-era model, so HEAD cannot reproduce Table 1 / Figure 2 and cannot load thesis-era checkpoints.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/models/LMGNN.py",
+     "lines": "136-139",
+     "quote": "# Align internal hidden dimension to CodeBERT hidden size (e.g. 768) ... hidden_dim = self.func_encoder.hidden_size"
+    },
+    {
+     "file": "/home/user/Graduation_Project/models/LMGNN.py",
+     "lines": "149-155, 288-296",
+     "quote": "self.context_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, ...) ... h_nodes_dense = self.context_norm(h_nodes_dense + attn_out)"
+    }
+   ],
+   "mechanism": "Every width in R-GCN, fusion, FFNs (3072) and classifier scales with 768 and the information flow differs (nodes contextualised by tokens before message passing); together with M06 and M35 the repository's current state cannot regenerate the thesis.",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.95,
+   "how_to_verify": "git diff f633e44 HEAD -- models/LMGNN.py; instantiate both with configs.json and compare sum of requires_grad numel excluding func_encoder: 4,968,804 vs 72,046,084.",
+   "suggested_fix": "Tag the commit that produced the thesis numbers or revert LMGNN.py to f633e44 behaviour behind a flag; record which commit each plots*/ directory came from."
+  },
+  {
+   "id": "M12",
+   "title": "The hybrid is not a superset of the baseline: its text path replaces the pretrained CLS readout with a from-scratch projection + 3 cross-attention blocks + mean pooling, so the gate cannot fall back to the baseline",
+   "category": "design_choice",
+   "severity": "major",
+   "claim": "[model-03] CodeBERTOnly classifies the pretrained CLS vector; BertRGCN never sees the CLS as such: 768-d token states pass through a random Linear(768->200), three bidirectional FusionBlocks, masked mean pooling over all tokens (including <s>/</s>), an FFN without residual, LayerNorm, Linear(400->200) and a 2-layer MLP. Even with alpha_graph->0 the hybrid cannot represent the baseline. Measured from-scratch parameters: baseline 154,202; hybrid 4,968,804 (3,812,602 in fusion alone).",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "215-219, 285-292",
+     "quote": "code_emb = self.func_encoder(..., return_cls=False) ... [baseline] cls_emb = self.func_encoder(..., return_cls=True) ... logits = self.classifier(cls_emb)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "299-321, 356-363",
+     "quote": "code_h = self.proj_code(code_emb) ... for layer in self.layers: ... code_vec = code_sum / denom_c ... fused = self.ffn_final(fused); fused = self.norm_final(fused); fused = self.linear_out(fused)"
+    }
+   ],
+   "mechanism": "The comparison confounds 'adding structural information' with 'discarding the CLS readout for a 4.97M-parameter stack trained from scratch on ~3%-positive data at lr 1e-4'; a 1.9-point F1 change is within what the readout change alone can cause, so Table 1 cannot attribute the gap to the graph branch.",
+   "hurts": [
+    "comparison_validity",
+    "hybrid"
+   ],
+   "bears_on": "both",
+   "confidence": 0.8,
+   "how_to_verify": "Ablation: hybrid with graph_vec zeroed and gate removed (text-only through the fusion stack); if its F1 is ~44 rather than ~46 the gap is the readout, not the graph. Also a variant with concat(CLS, fused) into the classifier.",
+   "suggested_fix": "Give the hybrid a direct CLS path or initialise gate/classifier so alpha_graph=0 reproduces the baseline; report a text-only-through-fusion ablation."
+  },
+  {
+   "id": "M13",
+   "title": "Graph-branch inputs are un-normalised frozen-CLS vectors that are nearly identical across nodes (mean pairwise cosine 0.986, one dimension carrying 57% of input_proj's gradient energy); no normalisation precedes input_proj in the thesis-era model",
+   "category": "design_choice",
+   "severity": "major",
+   "claim": "[model-04] Measured on 253 real CPG nodes from data/check_data: mean pairwise cosine of the 768-d node features 0.986; mean-vector norm 18.54 vs per-node deviation 2.07 (11%); dimension 588 is 14.5+/-0.34 for every node and receives 57% of input_proj's weight-gradient energy at init; the 1-bit type_id is 0.17% of input energy; mean-pooled raw features of different functions have cosine 0.9994. Label-relevant variation exists (centred cosine 0.30 same-label vs 0.02 different-label), but the thesis-era model feeds raw vectors into Linear(769->200) followed by six ReLU R-GCN layers with no normalisation until after the last layer. HEAD's context_norm partially addresses this but HEAD is not the thesis model.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "182-186",
+     "quote": "h = self.input_proj(x)\n        for conv in self.rgcn_layers:\n            h = F.relu(conv(h, edge_index, edge_type))\n\n        h = self.rgcn_norm(h)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/utils/process/embeddings.py",
+     "lines": "167-183",
+     "quote": "cls = hidden[:, 0] ... emb = np.concatenate([type_arr, feats], axis=1)             # [N, 1+768]"
+    }
+   ],
+   "mechanism": "The structural encoder starts from an almost constant per-node signal dominated by a RoBERTa 'massive activation' dimension; the discriminative 11% must be recovered by input_proj under AdamW lr 1e-4 while the constant component dominates its gradient. This handicaps the graph branch specifically (the text branch's token states are re-normalised inside fine-tuned CodeBERT layers), making 'graph contributes little' partly an artefact of feature conditioning.",
+   "hurts": [
+    "hybrid"
+   ],
+   "bears_on": "code",
+   "confidence": 0.7,
+   "how_to_verify": "Rerun /tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/model/followup.py; train the thesis-era hybrid with x[:,1:] standardised per dimension or LayerNorm(769) before input_proj and compare val F1 and gate curves.",
+   "suggested_fix": "Standardise node features per dimension on the training set (or LayerNorm before input_proj); give node type a richer encoding than one bit."
+  },
+  {
+   "id": "M14",
+   "title": "Figure 2 'modality weights' do not measure modality reliance: the gate acts on two post-fusion streams that have each attended to the other three times, the 'graph' stream's inputs are CodeBERT CLS vectors, and the identical-hyper-parameter replicate oscillates for 200 epochs and ends at R-GCN 0.7 with the same F1",
+   "category": "methodology",
+   "severity": "critical",
+   "claim": "[model-05, dynamics-1] §5.2/§6 conclude from alpha_code ~0.8 that semantic information dominates. In the code the gate weights code_vec and graph_vec that have each passed three bidirectional FusionBlocks (residual post-LN), so a_code weights a stream already containing graph information and vice versa; the graph stream's node features are frozen-CodeBERT CLS dimensions plus one type bit (the BLOCK node encodes the whole function, F4); the plotted value is the epoch mean of training-mode batch means of a softmax. The committed curves contradict the reading: within plots_Elevneth the gate sat at R-GCN~1.0 for epochs ~45-72 and at CodeBERT~0.8 for 135-200 with val F1 ~0.40-0.43 in both windows; plots_12 (same bs16/lr1e-4/br0.3) flips between ~0/1 and ~1/0 every few epochs for 200 epochs and ends at CodeBERT~0.3/R-GCN~0.7 at the same val F1 (~0.44); plots_selfatention collapsed to graph=1.0 with F1 0.07.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "306-311, 337-353",
+     "quote": "for layer in self.layers: code_h, graph_h = layer(code_h, graph_h, ...) ... combined_features = torch.cat([code_vec, graph_vec], dim=-1) ... gate_weights = F.softmax(gate_logits, dim=-1) ... self.last_weights = {\"code\": w_code.mean().item(), \"graph\": w_graph.mean().item()}"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_Elevneth/weights_curve_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "CodeBERT 0.6 ep1 -> ~0.95 ep5-10 -> swings ep20-45 -> ~0.0 ep45-72 (R-GCN ~1.0) -> ~0.8 ep135-200; title identical to thesis Fig. 2"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_12/weights_curve_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "same hyper-parameters; curves alternate between ~0.0 and ~1.0 dozens of times over ep1-200; final CodeBERT ~0.3, R-GCN ~0.7"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_Elevneth/training_metrics_bs16_lr1e-04_br0p30.png and plots_12/training_metrics_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "Val F1 ~0.40-0.43 during ep45-72 and ~0.42-0.44 during ep135-200 (Elevneth); plots_12 plateau ~0.42-0.45, ending ~0.44"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "387-388, 413-414, 1321-1329",
+     "quote": "total_w_code += model.fusion.last_weights[\"code\"] ... avg_w_code = total_w_code / max(1, n_batches) ... plt.title(f\"Modality Weights (bs={batch_size}, lr={lr_str})\")"
+    }
+   ],
+   "mechanism": "A gate over two mixed streams can take any value without changing how much the prediction depends on graph structure (the same information is available through both residual streams), and a stream seeded with text embeddings cannot be labelled 'structural'; the loss is flat along the gate direction, so the softmax gate drifts and saturates under optimisation noise (no temperature or regulariser, M15). Gate state is decoupled from performance, so the thesis's main interpretive conclusion rests on a quantity the architecture as specified in §3.5 does not define and that is not stable across runs.",
+   "hurts": [
+    "thesis_text",
+    "comparison_validity"
+   ],
+   "bears_on": "idea",
+   "confidence": 0.9,
+   "how_to_verify": "Open the weights_curve and training_metrics PNGs of plots_Elevneth, plots_12 and plots_selfatention side by side. Instantiate the thesis-era BertRGCN, freeze everything, sweep the gate logit bias from -5 to +5 and observe that classifier logits barely move. Measure modality reliance directly: shuffle/remove edges, zero graph_vec at test time, shuffle CodeBERT inputs; compare F1 drops.",
+   "suggested_fix": "Do not interpret the softmax gate as modality importance; replace §5.2's claim with ablation-based attribution (random-edge, graph-only, text-only), or gate the raw pooled branch outputs before any cross-attention mixing with a temperature or entropy penalty."
+  },
+  {
+   "id": "M15",
+   "title": "The gate is a bare Linear(400->2)+softmax with no temperature, regulariser or restoring force, and it has an absorbing collapsed state: in plots_selfatention it saturated to exactly 0/1 at epoch 11 and the network output became a constant",
+   "category": "design_choice",
+   "severity": "major",
+   "claim": "[model-06, dynamics-2] The gate input has per-dimension std ~0.88 (norm ~17.6 for 400 dims at init); a logit gap of 6 (weights 0.998/0.002) needs the gate weight vector to grow by only ~0.34 in the aligned direction; once saturated d softmax/d logit ~0 so the gate stops receiving gradient; downstream ffn_final has biases, no residual, and is followed by LayerNorm (measured output norm 19.99 for w_code = 0.5, 0.9, 0.99), so zeroing one half of the concat costs the loss nothing a bias cannot absorb. Nothing in the loss or weight decay penalises saturation. In plots_selfatention CodeBERT weight went to exactly 0.0 and R-GCN to 1.0 from epoch 11, train loss became constant (0.305) from epoch 9, val F1 stayed 0.07 (all-positive), and at epoch 20 every validation sample received P(y=1)=0.6954307 to within 1e-8. The run name and commented-out self-attention blocks suggest a variant, but the gate module is unchanged, so the failure mode applies to the thesis model.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "284, 341-342, 356-363",
+     "quote": "self.gate_layer = nn.Linear(proj_dim * 2, 2) ... gate_weights = F.softmax(gate_logits, dim=-1) ... fused = torch.cat([w_code * code_vec, w_graph * graph_vec], dim=-1) ... fused = self.ffn_final(fused)\n        fused = self.norm_final(fused)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_selfatention/weights_curve_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "CodeBERT 0.70-0.97 ep1-10, then exactly 0.0 ep11-36; R-GCN exactly 1.0 ep11-36"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_selfatention/val_p1_hist_val_bs16_lr1e-04_br0p30_ep20.png",
+     "lines": "image",
+     "quote": "x-axis offset '1e-8 + 6.954307e-1': all ~20k validation samples have identical P(class=1)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_selfatention/loss_curve_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "Train loss 0.30 -> 0.24 (ep7) -> 0.305 flat from ep9; val loss ~1.15 flat"
+    }
+   ],
+   "mechanism": "Saturation is cheap to reach, self-reinforcing (vanishing softmax gradient, w_code=0 cuts gradient to the code branch) and free in loss terms; the gate then acts as a global seed-dependent switch rather than per-sample routing, which destabilises the switched-off branch and makes the modality curve uninterpretable (M14). The thesis run avoiding collapse is a matter of seed, not design. Hurts the hybrid directly; the baseline has no gate.",
+   "hurts": [
+    "hybrid",
+    "thesis_text"
+   ],
+   "bears_on": "both",
+   "confidence": 0.7,
+   "how_to_verify": "Confirm the single-bar val_p1_hist files for ep11-36 in plots_selfatention; in a synthetic pass set gate_layer.bias to (-10, +10) and check grad norms on proj_code/cross_attn_code are ~0; log per-sample gate distribution and gate weight norm per epoch; retrain with a fixed 0.5/0.5 gate and with an entropy-regularised gate across 3 seeds.",
+   "suggested_fix": "Sigmoid gate initialised at 0.5 with an entropy or L2 penalty on gate logits, or a temperature; keep an ungated concat path in parallel; log gate entropy and abort on saturation; or drop the gate (plain concat)."
+  },
+  {
+   "id": "M16",
+   "title": "Fusion stack adds 4.97M (thesis-era) / 72M (HEAD) from-scratch parameters trained at lr 1e-4 on a ~3%-positive set; plausible overfitting driver but the (pre-gate) depth ablation argues against capacity being decisive",
+   "category": "design_choice",
+   "severity": "minor",
+   "claim": "[model-07] Trainable-from-scratch parameters: baseline 154,202; thesis-era hybrid 4,968,804 (FusionBlocks 2,895,600; ffn_final+linear_out 721,400; R-GCN 961,200; input_proj 154,000); HEAD 72,046,084. All share base lr 1e-4 and wd 5e-4. F3 shows train loss ~0 by epoch 50 while val loss plateaus/rises. However the depth ablation (1/3/5 layers all ending ~0.40-0.42; see M34 for the caveat that it predates the gate) indicates fusion capacity is not the main determinant.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "148-152",
+     "quote": "num_heads=4,\n            ffn_hidden_dim=hidden_dim * 4,\n            fusion_out_dim=hidden_dim,\n            dropout=0.1,\n            attn_layers=3,"
+    },
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "279-282",
+     "quote": "self.layers = nn.ModuleList([FusionBlock(proj_dim, num_heads, ffn_hidden_dim, dropout) for _ in range(attn_layers)])"
+    }
+   ],
+   "mechanism": "Thirty-two times more random parameters than the baseline with ~3% positives favour memorising training positives; but since 1 fusion layer performs like 5, reducing capacity alone does not recover the baseline, pointing back to input conditioning (M13) and readout (M12).",
+   "hurts": [
+    "hybrid"
+   ],
+   "bears_on": "both",
+   "confidence": 0.4,
+   "how_to_verify": "Compare plots_bigvul_attn1/3/5 curves; run a 0-layer fusion variant (projection + pooling + gate only).",
+   "suggested_fix": "Report the depth ablation; prefer the 1-layer variant as default."
+  },
+  {
+   "id": "M17",
+   "title": "A fresh clone cannot import run.py on another machine: models/layers.py os.chdir()s to a hard-coded /home/yudai path at import time (and seeds torch there), and run.py imports pyvis, which is absent from requirements.txt",
+   "category": "reproducibility",
+   "severity": "major",
+   "claim": "[model-08, provenance-02] models/layers.py executes os.chdir('/home/yudai/Project/research/Graduation_Project') at import (added 5f0658a, 2025-11-15; present in HEAD and thesis-era), so `from models.layers import Conv` (run.py:29) raises FileNotFoundError anywhere else; run.py:41 imports pyvis unconditionally and pyvis is not in requirements.txt. The module also calls torch.manual_seed(2020) as an import side effect, silently overriding any caller seeding. Data paths at run.py:69-71 and 1170-1188 are likewise hard-coded to /home/yudai. Reported as critical by one finder; merged as major because it is a two-line path error that blocks import but changes no number.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "2-3, 12",
+     "quote": "PROJECT_ROOT = \"/home/yudai/Project/research/Graduation_Project\"\nos.chdir(PROJECT_ROOT) ... torch.manual_seed(2020)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "29, 41, 69-71",
+     "quote": "from models.layers import Conv  /  from pyvis.network import Network   (grep -i pyvis requirements.txt -> no match) / train_path = \"/home/yudai/Project/research/Graduation_Project/data/raw/...\""
+    }
+   ],
+   "mechanism": "Either error aborts before argparse, so no mode (cpg/embed/train/test) is reachable for a third party; the student is unaffected, which is why it was never noticed.",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.95,
+   "how_to_verify": "On any machine without /home/yudai: python -c 'import models.layers' -> FileNotFoundError; python -c 'import pyvis' in a venv built from requirements.txt -> ModuleNotFoundError.",
+   "suggested_fix": "Delete lines 2-5 and 12 of models/layers.py; make paths CLI/config options relative to the repo; add pyvis or make the import lazy; seed in run.py."
+  },
+  {
+   "id": "M18",
+   "title": "Six stacked RGCNConv+ReLU without residual/dropout is a design risk, but init-time measurement shows no over-smoothing or gradient attenuation; the near-constant input (M13) is the measurable problem, not depth",
+   "category": "design_choice",
+   "severity": "minor",
+   "claim": "[model-10] On the real 75-node CPG at random init (3 seeds), mean pairwise cosine among node vectors decreases monotonically through the stack (0.983 after input_proj -> 0.90/0.83/0.79/0.78/0.75/0.76 after layers 1-6 -> 0.65 after rgcn_norm), node norms grow (5.6 -> 20-30), and gradient norms are flat across layers. The over-smoothing / vanishing-signal hypothesis is not supported by evidence available here; whether smoothing emerges after training cannot be determined without checkpoints.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "129-132, 183-184",
+     "quote": "RGCNConv(hidden_dim, hidden_dim, num_rel) for _ in range(num_layers) ... for conv in self.rgcn_layers:\n            h = F.relu(conv(h, edge_index, edge_type))"
+    }
+   ],
+   "mechanism": "With mean aggregation, a root weight and ReLU, random layers de-correlate rather than collapse the already-collinear inputs. Reported so that the result is not attributed to over-smoothing without evidence.",
+   "hurts": [
+    "hybrid"
+   ],
+   "bears_on": "code",
+   "confidence": 0.5,
+   "how_to_verify": "Run /tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/model/analyze.py (section 'R-GCN stack at random init'); for trained behaviour, load a checkpoint and recompute per-layer pairwise cosine on validation graphs.",
+   "suggested_fix": "If revisited: residual connections and dropout per R-GCN layer, sweep depth {2,4,6}; fix M13 first."
+  },
+  {
+   "id": "M19",
+   "title": "Edge relation type is taken from the containing list (AST/CFG/PDG block), not from the edge's own type field: relation AST == relation CFG, PDG relation polluted, 247 of 405 emitted edges mislabelled in the sample",
+   "category": "bug",
+   "severity": "critical",
+   "claim": "[graph-01] _gather_edges_from_blocks labels every edge with the name of the list in which its source node appears, ignoring e['type']. Each node's edges array lists all its outgoing edges of all kinds and every node is in the AST list, so relation 0 (AST) receives all edges, relation 1 (CFG) receives all edges of nodes that have any CFG edge (every node with edges, so CFG == AST), and relation 2 (PDG) receives all AST/CFG/PDG edges of nodes with a PDG edge. Sample row 0: Joern truth 67 AST / 59 CFG / 37 PDG (163) -> produced 405 typed edges {AST:158, CFG:158, PDG:89}, 247 with a type differing from Joern's. Present since cpg.py was created (5da5c75, 2025-11-05), so all thesis runs used it.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/functions/cpg.py",
+     "lines": "153-163",
+     "quote": "for kind in EDGE_KINDS:\n        for blk in func_json.get(kind, []) or []:\n            for e in blk.get(\"edges\", []) or []:\n                u = e.get(\"out\"); v = e.get(\"in\") ... _attach_edge(node_map, u, v, kind)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/graph/run_pipeline.py",
+     "lines": "output rows 0,2,4",
+     "quote": "row 0: truth 67 AST/59 CFG/37 PDG (163) -> produced edges=405 {AST:158, CFG:158, PDG:89}; same type as Joern: 158; type differs: 247. row 2: truth 10/6/0 -> {AST:16, CFG:16}. row 4: truth 61/54/2 -> {AST:117, CFG:117, PDG:9}"
+    },
+    {
+     "file": "/home/user/Graduation_Project (git)",
+     "lines": "git log -S'e.get(\"type\")' -- utils/functions/cpg.py",
+     "quote": "(empty): edge type field never read"
+    }
+   ],
+   "mechanism": "RGCNConv applies W_r per edge_type; with relations 0 and 1 holding identical edge sets the model effectively has one relation with doubled message weight plus a node-membership subset, so AST, CFG and PDG semantics are indistinguishable and data-dependence edges are drowned among mislabelled edges. This removes exactly the multi-relational inductive bias (§3.4.1 eq. 3) the hybrid was supposed to add over CodeBERT.",
+   "hurts": [
+    "hybrid",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.97,
+   "how_to_verify": "python -I /tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/graph/run_pipeline.py /home/user/Graduation_Project/data/check_data/cpg_head_check.json fast and compare 'by code-assigned type' with 'truth unique edges'; or patch cpg.py:163 to pass e.get('type') and diff the edge_type histograms.",
+   "suggested_fix": "Use etype = e.get('type') normalised through EDGE_MAP instead of kind, deduplicate by Joern edge id, regenerate embeddings, retrain the hybrid and report the delta."
+  },
+  {
+   "id": "M20",
+   "title": "Joern's `<global>` pseudo-method duplicates every function with a PDG-free copy: two graph rows per source function flow into training and evaluation",
+   "category": "bug",
+   "severity": "critical",
+   "claim": "[graph-02] graph_indexing keeps any graph whose file name ends in digits, which includes the per-file `<global>` pseudo-method (function name '0.c:<global>'), so the index join yields two rows per function: the real method graph and a `<global>` copy with zero PDG edges, almost no CFG-relation edges and an extra METHOD node whose CODE is the entire function text. Nothing downstream deduplicates. Sample rows: Index 0,0,1,1,2 with identical func text (row 0 real: 158 AST/158 CFG/89 PDG code-typed edges; row 1 `<global>`: 136 AST/10 CFG/0 PDG). In the 1500-file export: 1501 `<global>` vs 1291 real methods, i.e. ~54% of graph rows would be `<global>` copies.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/process/cpg_generator.py",
+     "lines": "120-133",
+     "quote": "if not f or f == \"N/A\" or f.startswith(\"<\"):\n        return None ... m = re.search(r\"(\\d+)$\", stem) ... return idx, {\"functions\": [graph]}"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "290-292, 355-358",
+     "quote": "right = data.create_with_index(df_graphs, [\"Index\", \"cpg\"]) ... dataset = data.inner_join_by_index(left, right) ... for nodes in func_dicts: g = process.nodes_to_input(nodes, row.target, ...)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/data/check_data/cpg_head_check.json",
+     "lines": "rows 0-3",
+     "quote": "row 0 Index=0 'am_get_mime_header' (75 nodes, PDG 37); row 1 Index=0 '0.c:<global>' (79 nodes, PDG 0, METHOD node CODE = 569-char function); row0.func==row1.func: True"
+    },
+    {
+     "file": "data/data_for_checking/cpg/test_0_cpg.json (via inspect script)",
+     "lines": "n/a",
+     "quote": "functions: 4908 {'real': 1291, 'global': 1501, 'external/N-A': 2116}"
+    }
+   ],
+   "mechanism": "Training: the hybrid sees two graph variants per label, about half structure-poor, pushing it to rely on the text branch and the gate toward CodeBERT. Evaluation: each val/test function is scored twice; for the hybrid the two copies have different graphs and can receive different predictions, so P/R/F1 average over real and degenerate graphs, while for CodeBERTOnly both copies are identical text and ratios are unaffected. The comparison is therefore biased against the hybrid.",
+   "hurts": [
+    "hybrid",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "python3 -I /tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/graph/inspect_sample.py data/check_data/cpg_head_check.json; on full data count rows per Index in any *_cpg.pkl or g.idx duplicates in *_input.pkl and function names ending in '<global>'.",
+   "suggested_fix": "Drop methods whose name ends with '<global>' and external stubs in graph_indexing or graph-for-funcs.sc; assert one graph per Index before the join; regenerate input.pkl and re-run both models."
+  },
+  {
+   "id": "M21",
+   "title": "All functions are written as .c, so C++ member functions parse to a 2-node self-loop stub graph (~14.5% of the sample)",
+   "category": "bug",
+   "severity": "major",
+   "claim": "[graph-03] to_files writes every function as `{idx}.c`, so Joern's C frontend handles C++ code. In the 1500-file sample 218 files (14.5%) produce no real method; 163 of them contain `::`. Such a function survives only as a `<global>` graph [BLOCK '', UNKNOWN <whole text>, METHOD_RETURN 'RET']; filter_nodes drops 'Unknown', leaving a 2-node graph with the self-loop fallback and edge_type all 0. The rate is from the 1500-file sample, not the full splits (BigVul is heavy in C++ projects, so it could be higher).",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/data/datamanager.py",
+     "lines": "89-93",
+     "quote": "for idx, row in data_frame.iterrows():\n        file_name = f\"{idx}.c\""
+    },
+    {
+     "file": "data/data_for_checking/cpg/test_0_cpg.json (via script)",
+     "lines": "n/a",
+     "quote": "files lacking real method: 218; of these containing '::': 163; 47.c <global> nodes: [('BLOCK', ''), ('UNKNOWN', 'YCPMap IniSection::getAllDoIt ()...'), ('METHOD_RETURN', 'RET')]"
+    },
+    {
+     "file": "/home/user/Graduation_Project/utils/process/embeddings.py",
+     "lines": "233-235",
+     "quote": "if edge_index.numel() == 0 and n_real > 0:\n        edge_index, _ = add_self_loops(edge_index, num_nodes=n_real)"
+    }
+   ],
+   "mechanism": "Roughly one in seven samples feeds the R-GCN a content-free 2-node graph (CLS of '' and 'RET') while the CodeBERT branch gets the full text, adding noise to the structural branch and directly training the gate toward CodeBERT.",
+   "hurts": [
+    "hybrid",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.8,
+   "how_to_verify": "Count rows in *_input.pkl with g.num_nodes <= 3; or re-run joern-parse on a few data/data_for_checking/joern/*.c files containing '::' renamed to .cpp and compare method counts.",
+   "suggested_fix": "Write .cpp when the source contains C++ markers (or always .cpp), and drop samples whose real method is missing instead of keeping the stub."
+  },
+  {
+   "id": "M22",
+   "title": "Node features are frozen CodeBERT CLS vectors of each node's raw nested CODE string (BLOCK = whole function body), not the per-node tokens §3.3.2 describes: the 'structural' modality is by construction a bag of embeddings of the same text the fine-tuned branch reads, so the graph branch is informationally redundant and the 0.8/0.2 gate is the predicted equilibrium",
+   "category": "idea_limitation",
+   "severity": "major",
+   "claim": "[graph-04, literature-2, data-10] Thesis §3.3.2 says each node's 'associated source code token s_v (e.g., variable identifiers or keywords)' is embedded; the code embeds the full Joern CODE property truncated at 128 tokens, cached by exact string, in fp16. In the real sample a BLOCK node's CODE is the whole function body (491 chars, 274 tokens, truncated), CONTROL_STRUCTURE/CALL nodes carry whole nested statements, the sum of node CODE is 3.9x the function length, and 28 of 75 nodes are 1-2 real tokens with identical vectors wherever they occur; the node label is reduced to one regex-derived bit. Combined with the undisclosed <1200-char filter (M28: every function fits in 512 tokens) and a noisy dataset (M29), the only thing the R-GCN can add is edge information over redundant node content. Published fusion systems that report gains use node features the text encoder cannot produce (DeepDFA: abstract dataflow features excluding identifiers) or fine-tune the node encoder jointly (Vul-LMGNN).",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/process/embeddings.py",
+     "lines": "23-28, 136-149, 158-183",
+     "quote": "max_len=128, ... dtype=torch.float16 ... code = node.get_code() ... miss_texts = [c for c in batch_codes if c not in self._cache] ... cls = hidden[:, 0] ... emb = np.concatenate([type_arr, feats], axis=1)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/utils/functions/cpg.py",
+     "lines": "85, 103",
+     "quote": "code = props.get(\"CODE\") or nd.get(\"code\") or \"\" ... node.type = 0 if re.search(r\"(Identifier|Name|Literal|Type|Decl)\", tname or \"\", re.I) else 1"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/graph/sample_detail.py",
+     "lines": "output row 0",
+     "quote": "BLOCK L2:C1 len= 491 ntok=274; CONTROL_STRUCTURE L13:C9 len= 240 ntok=139; <=4 tokens: 28 of 75; sum of node CODE chars=2246 vs func chars=569 (3.9x)"
+    },
+    {
+     "file": "thesis PDF",
+     "lines": "§3.3.2",
+     "quote": "for each node v ∈ V, we extract its associated source code token s_v (e.g., variable identifiers or keywords)"
+    },
+    {
+     "file": "https://arxiv.org/html/2212.08108v3 (DeepDFA)",
+     "lines": "Sec. 4.1, 5.3",
+     "quote": "DeepDFA does not use any text-/token-level information such as variable and function names"
+    },
+    {
+     "file": "https://arxiv.org/abs/2404.14719 (Vul-LMGNN)",
+     "lines": "698-699",
+     "quote": "In this training process, CodeLM updates the node embeddings"
+    }
+   ],
+   "mechanism": "Fusion can only help when the two branches carry non-redundant information. Here the BLOCK/METHOD node vectors are frozen-CodeBERT whole-function embeddings (the baseline's own input representation), leaf nodes get context-free near-contentless vectors, and the node label is one bit; message passing re-mixes projections of the same text, so the information-theoretically optimal gate weight for the graph branch is near zero, which matches Figure 2 and the gate indifference in M14. This is a limitation of the idea as instantiated (even with M19-M21 fixed) and the thesis text misdescribes it; it says little about whether structure+LM fusion can work on long functions, non-text node features or cleaner data.",
+   "hurts": [
+    "hybrid",
+    "thesis_text"
+   ],
+   "bears_on": "both",
+   "confidence": 0.85,
+   "how_to_verify": "Run sample_detail.py for the token-length table; ablate node features to (a) type bit only, (b) random fixed 768-d vectors, keeping edges, and (c) random edges: if hybrid F1 is unchanged within seed noise the CLS node features and the edges contribute nothing beyond the text branch; evaluate on functions >= 512 tokens (currently filtered out).",
+   "suggested_fix": "Embed only the node's own token span (leaf NAME, operator for CALL, keyword for CONTROL_STRUCTURE) or use DeepDFA-style abstract dataflow / node-label embeddings; exclude the whole-function BLOCK node from pooling; drop the 1200-char filter; report graph-only and random-edge ablations."
+  },
+  {
+   "id": "M23",
+   "title": "No symbolic normalisation, comment or literal removal reaches the graph or the text branch; the FUN_i/VAR_j normaliser only writes tokens.pkl, which nothing reads",
+   "category": "thesis_code_mismatch",
+   "severity": "major",
+   "claim": "[graph-05] Thesis §3.2.1-3.2.2 claim comments, string/char literals and hex are removed and identifiers mapped to FUN_i/VAR_j 'before graph construction', and §3.4.2 contrasts the text branch with 'the symbolic normalization applied during graph construction'. In the code parse.tokenizer/clean_gadget is called only by datamanager.tokenize, whose result goes to tokens.pkl with no reader. Graph node CODE strings and g.func are raw: row 4's BLOCK CODE contains '//if associated file is a blob...', LITERAL nodes with \"\\n\" exist, and 349 of 1500 Joern inputs contain comment lines, 416 string literals, 0 FUN/VAR tokens. Comments survive despite make_bigvul_json.py's remove_comments (034c4bb), indicating the data used was not produced by that script path.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/data/datamanager.py",
+     "lines": "178-180",
+     "quote": "def tokenize(data_frame: pd.DataFrame):\n    data_frame[\"tokens\"] = data_frame[\"func\"].apply(parse.tokenizer)"
+    },
+    {
+     "file": "grep -rn 'FILES.tokens|PATHS.tokens|tokens.pkl' --include=*.py .",
+     "lines": "n/a",
+     "quote": "only configs.py:62,80 (accessors), run.py:319-325,352 (mkdir/write), tests/test_embed_generator.py (prints dir): no reader"
+    },
+    {
+     "file": "/home/user/Graduation_Project/data/data_for_checking/joern/*.c",
+     "lines": "n/a",
+     "quote": "1500 files; 349 contain a comment line; 416 contain a string literal; 0 contain FUN\\d/VAR\\d"
+    },
+    {
+     "file": "thesis PDF",
+     "lines": "§3.2.1, §3.4.2",
+     "quote": "We delete string literals, character literals, and comments ... Unlike the symbolic normalization applied during graph construction, we employ a lightweight sanitization strategy"
+    }
+   ],
+   "mechanism": "Both branches saw raw code, so this does not bias hybrid vs baseline, but the experiment the thesis describes (normalised graph + raw text as complementary views) was never run; identical raw text in both branches further increases modality redundancy (M22), and the data provenance is unclear.",
+   "hurts": [
+    "thesis_text",
+    "reproducibility"
+   ],
+   "bears_on": "both",
+   "confidence": 0.95,
+   "how_to_verify": "grep -rn 'tokens' --include=*.py . ; grep -lE '^\\s*(//|/\\*)' data/data_for_checking/joern/*.c | wc -l ; inspect CODE of any LITERAL node in cpg_head_check.json.",
+   "suggested_fix": "Apply clean_gadget to func before to_files (and to g.func if the text is kept), or rewrite §3.2.2/§3.4.2 to describe what ran; delete the dead tokens.pkl step."
+  },
+  {
+   "id": "M24",
+   "title": "Exported PDG edges appear to be data-dependence only and sparse, although §3.3.1 claims data and control dependencies",
+   "category": "thesis_code_mismatch",
+   "severity": "minor",
+   "claim": "[graph-06] In the real-pipeline sample all PDG edges connect IDENTIFIER/CALL nodes (row 0: 37 edges, pairs IDENTIFIER->IDENTIFIER 14, CALL->IDENTIFIER 11, IDENTIFIER->CALL 12); none originates at a CONTROL_STRUCTURE although rows 0 and 4 each contain 3, so control-dependence edges are absent; coverage is uneven (row 4: 2 PDG edges for 71 nodes; row 2: 0). The defining script graph-for-funcs.sc is missing (M39), so edge semantics cannot be audited.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/graph/inspect_sample.py",
+     "lines": "output rows 0 and 4",
+     "quote": "row 0 PDG endpoints: {('IDENTIFIER','IDENTIFIER'): 14, ('CALL','IDENTIFIER'): 11, ('IDENTIFIER','CALL'): 12}; row 4 unique edges {'AST': 61, 'CFG': 54, 'PDG': 2}, CONTROL_STRUCTURE: 3"
+    },
+    {
+     "file": "thesis PDF",
+     "lines": "§3.3.1",
+     "quote": "PDG Edges: Represent data dependencies and control dependencies."
+    }
+   ],
+   "mechanism": "Fewer and purely data-flow PDG edges give the R-GCN less structural information than claimed (and after M19 they are mixed into the other relations anyway).",
+   "hurts": [
+    "hybrid",
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.6,
+   "how_to_verify": "Recover graph-for-funcs.sc and check whether it exports CDG edges; or regenerate a few CPGs with Joern and compare cpg.method.cdg vs reachingDef counts with the 'PDG' counts in cpg_head_check.json.",
+   "suggested_fix": "Export REACHING_DEF and CDG as separate relations, or state DDG-only in the thesis."
+  },
+  {
+   "id": "M25",
+   "title": "Forward-only edges and a one-bit node type: direction is preserved but no reverse relations are added and the Joern node label is discarded",
+   "category": "design_choice",
+   "severity": "major",
+   "claim": "[graph-07] build_edges_all emits exactly one directed edge per Joern edge, src = Joern 'out', dst = Joern 'in' (405/405 emitted pairs match, 0 reversed; the stub field names are inverted but used consistently). No reverse relation is added anywhere; the only node-type feature is a regex-derived 0/1. With PyG RGCNConv flowing source->target, AST parents never aggregate from children, CFG predecessors never from successors, defs never from uses; a METHOD/BLOCK root receives nothing from the body.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/process/embeddings.py",
+     "lines": "205-208",
+     "quote": "if e.node_in in nodes and nodes[e.node_in].order != u:\n                src.append(nodes[e.node_in].order); dst.append(u) ... src.append(u); dst.append(nodes[e.node_out].order)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/graph/run_pipeline.py",
+     "lines": "output",
+     "quote": "direction check: (src,dst) matches a Joern out->in edge: 405/405; reversed: 0"
+    },
+    {
+     "file": "grep -n 'flip|to_undirected|reverse' models/LMGNN.py",
+     "lines": "n/a",
+     "quote": "no matches in HEAD or thesis-era"
+    }
+   ],
+   "mechanism": "Standard CPG-GNN baselines (Devign, ReVeal, IVDetect) add inverse relations so information flows both ways; here over 6 layers a node is informed only by its AST ancestors / CFG predecessors / reaching definitions, and the mean readout mixes many leaf nodes that only ever received messages from their parent. Collapsing the label into one bit discards the main categorical structural cue (CALL vs CONTROL_STRUCTURE vs RETURN vs LOCAL). Both weaken the structural signal; neither is a bug.",
+   "hurts": [
+    "hybrid"
+   ],
+   "bears_on": "both",
+   "confidence": 0.85,
+   "how_to_verify": "Inspect edge_index of any graph in *_input.pkl: for AST edges the parent index never appears as dst of its child; check x[:,0] has only two values.",
+   "suggested_fix": "Add reversed copies of each relation (num_relations 6) or to_undirected per relation; replace the 0/1 bit with a learned embedding over Joern labels."
+  },
+  {
+   "id": "M26",
+   "title": "Latent silent data loss: zip(slices, json_files) misaligns after any Joern failure, yielding empty joins and dropped slices",
+   "category": "bug",
+   "severity": "minor",
+   "claim": "[graph-08] joern_create skips a slice on timeout (300 s per 500-function .bin), non-zero exit or missing output with only a print, returning a shorter json_files list; _process_split pairs slices with json_files by position, so after the first skipped slice every later slice_df is joined with a different slice's JSON (disjoint indices -> empty join, rows=0 pickles) and trailing slices are dropped. Whether this fired is unrecorded.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/process/cpg_generator.py",
+     "lines": "88-106",
+     "quote": "except subprocess.TimeoutExpired:\n            print(f\"[ERROR] Timeout after {timeout_sec}s: {cpg_file}\")\n            continue ... if res.returncode != 0: ... continue"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "279-283",
+     "quote": "for (s, slice_df), json_file in zip(slices, json_files):"
+    }
+   ],
+   "mechanism": "If triggered, whole 500-function slices vanish from train/val/test for both models equally, shrinking the data and changing class balance without error; it makes the reported dataset size unverifiable.",
+   "hurts": [
+    "both",
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "Check data/cpg for *_cpg.pkl files with 0 rows or compare the number of *_cpg.pkl files with ceil(n_filtered/500) per split; unit-test _process_split with a joern_create stub that drops one file.",
+   "suggested_fix": "Return (cpg_file, json_path) pairs and join on the slice id parsed from the file stem; fail loudly on an empty join."
+  },
+  {
+   "id": "M27",
+   "title": "The 500-node cut, (line,col) ordering and strict=False filtering are effectively no-ops under the 1200-char filter and do not explain the result",
+   "category": "design_choice",
+   "severity": "minor",
+   "claim": "[graph-09] order_nodes sorts by (line, col, id) with missing line numbers mapped to 10**9, filter_nodes(strict=False) keeps empty-CODE nodes, and nodes beyond 500 are dropped; in practice, with select() keeping only functions < 1200 chars, the 1500-input export has at most 288 AST nodes per method (p50 12, p90 93, p99 172, 0 over 500), no node lacks LINE/COLUMN, and the only empty-CODE node (UNKNOWN) is removed by label. Node order does not influence the model (permutation-equivariant components).",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/functions/cpg.py",
+     "lines": "8-28, 40-46",
+     "quote": "def _as_int(v, default=10**9): ... if len(nodes_by_pos) > max_nodes: ... if (node.label not in [\"Comment\", \"Unknown\"])"
+    },
+    {
+     "file": "data/data_for_checking/cpg/test_0_cpg.json (via script)",
+     "lines": "n/a",
+     "quote": "AST node count per method: max 288  p50 12  p90 93  p99 172  n>500: 0"
+    }
+   ],
+   "mechanism": "These parts neither remove nor reorder anything the model could notice; the 1200-char filter (M28) is what bounds graph size.",
+   "hurts": [],
+   "bears_on": "neither",
+   "confidence": 0.85,
+   "how_to_verify": "max(g.num_nodes) over any *_input.pkl; grep 'CPG cut' in embedding logs if kept.",
+   "suggested_fix": "No code change; document the filter and node-count distribution."
+  },
+  {
+   "id": "M28",
+   "title": "Undisclosed len(func) < 1200 filter restricts the task to functions that fit in 512 tokens, the regime where structure has least to add; its effect on the positive rate is unrecorded",
+   "category": "methodology",
+   "severity": "major",
+   "claim": "[data-03] select() keeps only functions shorter than 1200 characters, applied to each split after splitting; the thesis never mentions it. 1200 characters is roughly 300-400 BPE tokens (estimate), so every kept function fits in max_length=512 and the 500-node graph branch cannot add coverage beyond the sequence branch; the kept sample's p90 = 914 and max = 1194 (F5) shows substantial mass just below the cutoff. The thesis's '~3% vulnerable' versus BigVul's published 5.78% is consistent with the pipeline (dedup + filter + Joern failures) removing positives disproportionately, but this cannot be verified without the data (speculative part).",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "168-174, 233-236",
+     "quote": "def select(dataset: pd.DataFrame) -> pd.DataFrame: / len_filter = dataset.func.str.len() < 1200 ... train_filtered = data.apply_filter(train_raw, select) / valid_filtered = ... / test_filtered = ..."
+    },
+    {
+     "file": "thesis §4.1",
+     "lines": "p.5",
+     "quote": "We utilize the BigVul dataset [6] ... (approx. 3% vulnerable)"
+    },
+    {
+     "file": "Croft et al. 2023, arXiv 2301.05456",
+     "lines": "199",
+     "quote": "Big-Vul [14] Security vendor provided 188,636 5.78"
+    }
+   ],
+   "mechanism": "(a) Task definition: the comparison is only about short functions where the token sequence already contains the whole function, the regime in which CFG/PDG structure adds least and the hybrid's machinery is pure overhead — favouring the text-only baseline by construction. (b) The filter changes the positive rate per split in an unrecorded way (class weights are computed on the filtered train set, so training stays consistent), so the reported numbers describe a dataset nobody can reconstruct from the thesis.",
+   "hurts": [
+    "hybrid",
+    "comparison_validity",
+    "thesis_text"
+   ],
+   "bears_on": "both",
+   "confidence": 0.7,
+   "how_to_verify": "After make_bigvul_json.py: print len(func) quantiles and vul-rate for func.str.len()<1200 vs >=1200 per split; tokenise 200 kept functions and report max token count.",
+   "suggested_fix": "Drop the filter (the code already truncates tokens to 512 and nodes to 500) or report it with before/after counts per split and class; re-run both models on the long-function slice."
+  },
+  {
+   "id": "M29",
+   "title": "BigVul label noise (25-54% of vulnerable labels correct), 12.7% exact copies and a function-level random split with exact-string dedup only cap what any model can show; a 1.9-point gap is not diagnostic",
+   "category": "methodology",
+   "severity": "major",
+   "claim": "[data-04, literature-3] make_bigvul_json.py removes conflicting-label functions, drops exact duplicates of the cleaned text, then does a stratified random 80/10/10 function-level split (seed 42) with no grouping by commit or project. Published audits: label accuracy 0.543 (Croft et al.), 25.0% (DiverseVul/PrimeVul), 38% (Top Score); uniqueness 0.830; 12.7% exact copies; CodeBERT F1 62.88 on BigVul vs 4.49-20.86 on de-duplicated, time-split PrimeVul. Exact dedup does not remove near-duplicates (same function across neighbouring commits, vulnerable/fixed pairs) or project leakage. The thesis describes no dedup, split, seed or counts.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/data/scripts/make_bigvul_json.py",
+     "lines": "181-190, 272-295",
+     "quote": "train_test_split(X, y, test_size=1 - train_rat, random_state=42, stratify=y) ... df = df.drop_duplicates(subset=[\"func\"], keep=\"first\").copy()"
+    },
+    {
+     "file": "Croft et al. 2023, arXiv 2301.05456",
+     "lines": "299-312",
+     "quote": "accuracy values of 0.8 (Devign), 0.543 (Big-Vul), and 0.286 (D2A) ... Uniqueness 0.830"
+    },
+    {
+     "file": "PrimeVul, arXiv 2403.18624",
+     "lines": "Tables I, II, V",
+     "quote": "BigVul 25.0% [label accuracy]; 12.7% copy; CodeBERT BV->BV 62.88, PV->PV 4.49 / 20.86"
+    }
+   ],
+   "mechanism": "With roughly half or more of the positive labels wrong and near-duplicates spanning splits, test F1 is bounded by shared label noise and rewarded by surface memorisation of project-specific token patterns, which a fine-tuned token model does best and a graph over the same tokens cannot improve; both arms fit the same noise, so a 1.9-point difference cannot be attributed to the representation. The instrument, not the code or idea, is the limit.",
+   "hurts": [
+    "comparison_validity",
+    "thesis_text"
+   ],
+   "bears_on": "neither",
+   "confidence": 0.85,
+   "how_to_verify": "For each test function compute nearest-train token Jaccard (or MinHash) and report the fraction > 0.9; group by commit_id (in MSR_data_cleaned.csv) and count test commits that appear in train; compare 3-seed spread with the 1.89 gap.",
+   "suggested_fix": "Report dedup/split details; add a commit- or project-grouped split; evaluate on PrimeVul's paired test set."
+  },
+  {
+   "id": "M30",
+   "title": "Checkpoint selection is the noise maximum over 200 epochs x 19 thresholds of val F1 on fully saturated outputs: train loss ~0 by epoch 50-100, val CE past its minimum by 100+ epochs, probabilities polarised into [0,0.05] / [0.95,1], so the §4.2 threshold search is inert at the selected epochs",
+   "category": "methodology",
+   "severity": "major",
+   "claim": "[data-07, dynamics-4] Thesis-era selection saves the epoch maximising max_t F1_val(t) over 19 thresholds with a +1e-4 margin; with a val-F1 plateau fluctuating +/-0.01-0.02, improvements > 1e-4 keep occurring by chance, so patience 50 never fired (all three final runs completed 200 epochs) and the saved checkpoint is the noise maximum among ~150 memorised states; the threshold is then re-tuned on the same validation set. Train loss (weighted focal) reaches ~0 by epoch 50-100 while validation CE plateaus (plots_Elevneth/plots_12: 0.15-0.2 from ep~30) or rises (plots_codebert_first: min ~0.18 at ep~75 -> 0.42 at ep200; bigvul_attn3 0.21 -> 0.4-0.55). By epoch 100-150 validation P(y=1) sits almost entirely in [0,0.05] (~19.5k) or [0.95,1] (~350-500) with max-softmax confidence >= 0.97 for all samples, so the grid tau in {0.05..0.95} cannot move more than a handful of samples and misclassified positives (p~0) cannot be recovered by any threshold. HEAD's double-extend (F7) is absent in the thesis-era validate(), so it did not affect thesis numbers.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "443, 565-567, 1221-1240",
+     "quote": "loss = F.cross_entropy(logits, batch.y) [validate: plain CE] ... for t in np.linspace(0.05, 0.95, num_steps): preds = (probs >= t) ... if f1_for_es > best_f1 + 1e-4: ... torch.save(...)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_Elevneth/loss_curve_bs16_lr1e-04_br0p30.png and plots_codebert_first/loss_curve_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "Train 0.30 -> ~0.00 by ep100; Val flat 0.15-0.2 (Elevneth); Val min ~0.18 at ep75 then rising to ~0.42 at ep200 while Train ~0.0 (codebert_first)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_Elevneth/val_p1_hist_val_bs16_lr1e-04_br0p30_ep150.png",
+     "lines": "image",
+     "quote": "~19,500 samples in [0,0.05], ~400 in [0.95,1.0], visually empty between; ep200 identical; plots_12 and plots_codebert_first ep200 same two-bar shape"
+    },
+    {
+     "file": "/home/user/Graduation_Project/plots_Elevneth/val_conf_hist_val_bs16_lr1e-04_br0p30_ep200.png",
+     "lines": "image",
+     "quote": "single bar at confidence ~0.98-1.0 (~19,700 samples)"
+    }
+   ],
+   "mechanism": "Early stopping on noisy F1 with patience 50 runs 100+ epochs past the val-loss minimum; the weighted focal objective keeps pushing margins until outputs saturate, so the claimed benefit of §4.2 is not realised at the selected checkpoints, the recall ceiling (~0.33-0.40) is set by confidently wrong positives, the chosen epoch (and the gate state attributed to 'the model' in Figure 2) is a function of noise, and selection variance is added on top of seed variance. Symmetric between arms (train and val losses plotted are different functions, so only trends are comparable).",
+   "hurts": [
+    "both",
+    "thesis_text",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.85,
+   "how_to_verify": "Count bins with visible mass in ep100-ep200 val_p1_hist files of plots_Elevneth; with a saved checkpoint compute F1 at tau=0.05..0.95 on validation (spread should be within ~0.01); compare test F1 at the saved epoch and at +/-10 epochs.",
+   "suggested_fix": "Select at the val-loss minimum or by a smoothed F1 with a patience that can fire (10-20); tune the threshold on a validation half not used for selection; report chosen epoch and tau* per run; add label smoothing or calibration-based stopping."
+  },
+  {
+   "id": "M31",
+   "title": "Baseline 45.74 is below every published fine-tuned CodeBERT number on random-split BigVul (54-93) because only the last 2 of 12 layers are tuned under an untuned recipe; the protocol is otherwise symmetric, so both arms are recipe-limited and the comparison measures the recipe",
+   "category": "methodology",
+   "severity": "major",
+   "claim": "[literature-5, data-08] Published fine-tuned CodeBERT-class F1 on random-split BigVul: 54.48 (PDBERT), 62.88 (PrimeVul's BigVul split), 91-93 (LineVul / Steenhoek / DeepDFA); DeepDFA's table shows the identical backbone spanning 21 to 93 F1 by recipe alone. The thesis's 45.74 was produced with tune_last_n_layers=2 (both arms), the <1200-char filter (M28) and a ~3% positive rate. Only one CodeBERT-only run exists (plots_codebert_first); the baseline got no sweep and inherited the hybrid lineage's hyper-parameters (M04). Everything else is shared code: criterion, patience/epochs, val-threshold tuning in test mode for both model_type values, 512-token truncation, AdamW wd 5e-4, bert_lr = lr*ratio via the same name test; heads are comparable (baseline CLS->Linear(768,200)->ReLU->Dropout->Linear(200,2); hybrid fused->LN->Linear(400->200)->Linear(200,200)->ReLU->Dropout->Linear(200,2)). The thesis's exact-func dedup removes the 12.7% exact-copy leakage, so the fair comparison band is 54-63, not 91.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "140, 246, 305-318",
+     "quote": "tune_last_n_layers=2 (both models) ... for p in self.bert.parameters(): p.requires_grad = False ... for layer in encoder_layers[-tune_last_n_layers:]: ... p.requires_grad = True"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "1235, 1461-1470",
+     "quote": "criterion = FocalLoss(alpha=class_weights, gamma=2.0) (shared) ... test mode: evaluate_with_threshold(..., 0.5) then search_best_threshold on val for either model_type"
+    },
+    {
+     "file": "https://arxiv.org/abs/2402.00657 (pdbert.txt); https://arxiv.org/abs/2403.18624 (primevul.txt); https://arxiv.org/html/2212.08108v3",
+     "lines": "533; 426; Table 3",
+     "quote": "CodeBERT 54.48 (Big-Vul F1) ... CB BV 95.57 62.88 ... CodeBERT 21.04 (6.72) ... LineVul 93.23 (0.31) [same backbone, different recipe]"
+    },
+    {
+     "file": "/home/user/Graduation_Project (plots dirs)",
+     "lines": "-",
+     "quote": "plots_codebert_first: 604 files, all bs16_lr1e-04_br0p30; no other CodeBERT-only directory"
+    }
+   ],
+   "mechanism": "Freezing 10/12 layers keeps the text branch from adapting lower-layer token features to vulnerability cues; recipe effects are tens of points while representation effects are 0-3 points (M45), so two under-trained systems compared inside noise say nothing about the ordering. Symmetric protocol means the ordering is not caused by baseline favouritism (if anything tuning asymmetry favours the hybrid); the untuned baseline means the absolute level is not comparable to published BigVul results.",
+   "hurts": [
+    "both",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.7,
+   "how_to_verify": "On the thesis's own split train CodeBERT with all layers unfrozen, max_length 512, no <1200 filter, lr 2e-5, 10 epochs, threshold 0.5 (LineVul recipe) and compare to 45.74; count positives/total in the jsonl splits; grep -n 'model_type' run.py to confirm shared criterion/scheduler/test code.",
+   "suggested_fix": "Unfreeze all CodeBERT layers in both arms (or add a fully fine-tuned reference row); give the baseline its own small lr sweep; disclose the filter and positive rate; state that numbers are not comparable to published BigVul results."
+  },
+  {
+   "id": "M32",
+   "title": "No ablations were run or reported: the experiments that would separate 'idea has no signal here' from 'fusion is badly optimised' (graph-only, random-edge, no-gate concat, frozen fusion) are missing, while unreported partial ablations sit in the repo",
+   "category": "idea_limitation",
+   "severity": "major",
+   "claim": "[data-09] The thesis reports no graph-only, random-edge, no-gate/concat or frozen-fusion ablation. The repo holds unreported fusion-depth runs (plots_bigvul_attn1/3/5, M34), a self-attention variant that collapsed (plots_selfatention, M15) and a legacy graph-only class (Net) with no run. Without a graph-only number the gate weight of ~0.2 for R-GCN cannot be interpreted: if graph-only is at the all-positive floor (~0.07 F1) the gate discards a branch with no signal and §6's 'optimisation difficulty' story is unsupported; if graph-only is substantially above the floor, fusion destroys information and the code is at fault.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project (plots dirs)",
+     "lines": "-",
+     "quote": "plots_bigvul_attn1 (41 epochs), plots_bigvul_attn3, plots_bigvul_attn5, plots_selfatention (40 epochs): present in repo, absent from thesis"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/layers.py",
+     "lines": "90-91",
+     "quote": "class Net(nn.Module): / def __init__(self, gated_graph_conv_args, conv_args, emb_size, device, Conv=None):  (graph-only, unused)"
+    },
+    {
+     "file": "thesis §5.1-§6",
+     "lines": "p.6",
+     "quote": "The structural information provided by the R-GCN is not effective enough to overcome the optimization difficulties caused by the complex model architecture."
+    }
+   ],
+   "mechanism": "Each missing ablation answers one question the thesis speculates about: graph-only -> does the R-GCN branch carry class signal; random edges -> does CFG/PDG structure matter beyond the bag of node embeddings; concat-without-gate -> is the gate the source of F2's instability; frozen fusion / linear probe -> optimisation or information. This is the central reason the user's question (code or idea) cannot be answered from the thesis alone.",
+   "hurts": [
+    "thesis_text",
+    "comparison_validity"
+   ],
+   "bears_on": "idea",
+   "confidence": 0.85,
+   "how_to_verify": "Train BertRGCN with proj_code fed zeros and with edge_type/edge_index shuffled; train CodeBERTOnly + mean-pooled R-GCN concatenated with a linear head; each is a one-flag change in BertRGCN.forward.",
+   "suggested_fix": "Add the four ablations with 3 seeds each next to Table 1; replace the §6 speculation with whichever mechanism the ablations support."
+  },
+  {
+   "id": "M33",
+   "title": "Table 1 omits Accuracy and the fixed-threshold row although §4.1 lists Accuracy and the test code prints both",
+   "category": "thesis_code_mismatch",
+   "severity": "minor",
+   "claim": "[data-11] §4.1 names Accuracy, Precision, Recall, F1; Table 1 reports only P/R/F1. The test path computes and prints Acc for both the 0.5 and the val-tuned threshold; the thesis reports neither the 0.5-threshold row nor which line Table 1 is (see M36).",
+   "evidence": [
+    {
+     "file": "thesis §4.1",
+     "lines": "p.5",
+     "quote": "we employ standard metrics: Accuracy, Precision, Recall, and F1-score"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "1461-1472",
+     "quote": "loss0, acc0, p0, r0, f10 = evaluate_with_threshold(model_test, test_loader, threshold=0.5) ... print('Test (best thr={:.2f} from Val): ... Acc: {:.2f}%, P: ..., R: ..., F1: ...')"
+    }
+   ],
+   "mechanism": "Cosmetic; accuracy at 3% positives is ~0.95-0.97 for any model, but omitting the fixed-threshold row hides how much of the reported F1 comes from threshold tuning.",
+   "hurts": [
+    "thesis_text"
+   ],
+   "bears_on": "neither",
+   "confidence": 0.95,
+   "how_to_verify": "Compare Table 1 with the two printed 'Test (...)' lines in the student's test log.",
+   "suggested_fix": "Report both rows with Accuracy and the selected tau* per model."
+  },
+  {
+   "id": "M34",
+   "title": "The on-disk fusion-depth ablation (1/3/5 and 2/3/5 layers) is flat within +/-0.01 F1, contradicting §6's 'complexity of the fusion' explanation, but it was produced by the pre-gate architecture and is unreported, so it characterises the thesis model only by assumption",
+   "category": "idea_limitation",
+   "severity": "major",
+   "claim": "[dynamics-6, provenance-08] plots_bigvul_attn1/3/5 (bs16 lr1e-4 br0.3) end at val F1@0.5 ~0.41 for 1, 3 and 5 fusion layers; plots_attn_layer2/3/5 (bs8 lr5e-5 br0.2) end at ~0.48 for 2, 3 and 5 layers. Depth neither helps nor hurts. However these directories contain loss/metrics/acc curves and no weights_curve, which every f633e44-era run writes alongside them, so they come from the gate-less CrossAttentionBlock stack between 2025-11-16 and 2026-01-13 (cf89c07: GraphCodeFusion(..., attn_layers=3) with no gate; 'class FusionBlock' and 'last_weights' first appear in f633e44); attn_layers is hard-coded to 3 in both committed snapshots, so the 1- and 5-layer runs cannot be regenerated from committed code.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/plots_bigvul_attn1/3/5 training_metrics_bs16_lr1e-04_br0p30.png",
+     "lines": "image",
+     "quote": "41 / 65 / 56 epochs; Val F1 ~0.40-0.42 from ep25, final ~0.41 in all three; plots_attn_layer2/5 ~0.48"
+    },
+    {
+     "file": "plots_bigvul_attn1/ plots_bigvul_attn3/ plots_bigvul_attn5/ plots_attn_layer2/3/5",
+     "lines": "ls",
+     "quote": "non-epoch files: loss_curve_*, training_acc_*, training_metrics_* (no weights_curve)"
+    },
+    {
+     "file": "git show cf89c07:models/layers.py",
+     "lines": "206-224",
+     "quote": "class GraphCodeFusion(nn.Module): ... attn_layers=3,)   ('class FusionBlock', 'last_weights' first in f633e44)"
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/LMGNN.py",
+     "lines": "152",
+     "quote": "attn_layers=3,   [hard-coded]"
+    }
+   ],
+   "mechanism": "If the graph modality carried signal complementary to CodeBERT, changing cross-attention depth would change something (more capacity to exploit it, or faster overfitting); a flat response across 1-5 layers, together with gate indifference (M14), is the signature of an input redundant given the other branch (M22), i.e. an information limitation rather than the optimisation difficulty §6 proposes. The transfer of this conclusion to the gated thesis model is an assumption because the ablation predates the gate.",
+   "hurts": [
+    "thesis_text",
+    "hybrid",
+    "reproducibility"
+   ],
+   "bears_on": "idea",
+   "confidence": 0.65,
+   "how_to_verify": "for d in plots_bigvul_attn1 plots_bigvul_attn3 plots_bigvul_attn5 plots_attn_layer2 plots_attn_layer3 plots_attn_layer5; do echo $d $(ls $d | grep -c weights_curve); done (all 0); git show cf89c07:models/layers.py | grep -c gate; rerun depth 1/3/5 with the gated f633e44 architecture plus graph-only / random-edge ablations.",
+   "suggested_fix": "Rerun the depth ablation with the gated architecture, record which code produced it, and report it with the modality ablations instead of the §6 speculation."
+  },
+  {
+   "id": "M35",
+   "title": "No committed code state can regenerate Figure 2 or any 200-epoch run: curve-plotting code exists only at f633e44 (deleted in 72d02e9), f633e44's configs.json says epochs=100 with no CLI override, and HEAD has no plotting at all",
+   "category": "reproducibility",
+   "severity": "critical",
+   "claim": "[provenance-01, dynamics-8] Figure 2 (= plots_Elevneth/weights_curve_bs16_lr1e-04_br0p30.png, F2) covers 200 epochs; the weights_curve/loss_curve plotting code exists only at f633e44 and was removed in 72d02e9, while f633e44's configs.json has epochs=100 and NUM_EPOCHS is read only from configs.json (no --epochs flag); the commit that set epochs=200 (72d02e9) removed plotting and added the pre-GCN attention (F1). The 1- and 5-layer ablation runs likewise need attn_layers values hard-coded to 3 in both snapshots. All plots*/ directories were added in one commit (72d02e9), so the figures were produced by an uncommitted intermediate working tree.",
+   "evidence": [
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "1074, 1329-1333",
+     "quote": "NUM_EPOCHS = context.epochs [no '--epochs' argparse] ... plt.title(f\"Modality Weights (bs={batch_size}, lr={lr_str})\") ... plot_filename = f\"weights_curve_bs{batch_size}_lr{lr_str}_br{ratio_str}.png\""
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/configs.json",
+     "lines": "41",
+     "quote": "\"epochs\" : 100,   (git log -p: changed 100->200 only in 72d02e9 2026-02-17)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "62",
+     "quote": "PLOT_DIR = Path(\"./plots\")   (HEAD: grep 'weights_curve|history\\[' run.py returns nothing)"
+    },
+    {
+     "file": "plots_Elevneth/",
+     "lines": "ls",
+     "quote": "200 confusion_matrix files; weights_curve_bs16_lr1e-04_br0p30.png present; all 14 plots* dirs first added in 72d02e9"
+    }
+   ],
+   "mechanism": "A run with 200 validation epochs and a weights curve needs f633e44 code plus an edited uncommitted configs.json, possibly plus uncommitted model variants; nobody can check out a commit and rerun Figure 2, and HEAD cannot even draw it, which weakens every interpretation drawn from the curves in both directions.",
+   "hurts": [
+    "reproducibility",
+    "thesis_text"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "cd /home/user/Graduation_Project; git log --format='%h %ad %s' --date=short -S'weights_curve' -- run.py (f633e44 add, 72d02e9 remove); git show f633e44:configs.json | grep epochs (100); git show 72d02e9:configs.json | grep epochs (200); grep -n -- '--epochs' run.py (none); ls plots_Elevneth | grep -c confusion_matrix (200).",
+   "suggested_fix": "Tag or reconstruct the exact working tree that produced the thesis (f633e44 + configs.json epochs=200 + attn_layers flag) as a release; keep plotting code behind a flag."
+  },
+  {
+   "id": "M36",
+   "title": "Table 1 has zero on-disk trace: no numbers, checkpoints, logs or sweep summary survive; only validation PNGs do, and nothing records which printed test line (thr=0.5 vs tuned) the thesis reports",
+   "category": "reproducibility",
+   "severity": "critical",
+   "claim": "[provenance-03] None of the six Table 1 numbers occurs anywhere in the repository; *.pth, *.log/*.out and wandb/ are gitignored; HEAD removed the SWEEP SUMMARY print (all_results is created but never appended or printed); test mode prints two result lines (thr=0.50 and tuned thr) and nothing records which one Table 1 is.",
+   "evidence": [
+    {
+     "file": ".gitignore",
+     "lines": "15, 27, 57-58, 61",
+     "quote": "*.log / *.pth / *.log *.out / wandb/"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "1267, 1460-1471",
+     "quote": "all_results = []  (never appended/printed at HEAD) ... print('Test (thr=0.50): ... F1') ... print('Test (best thr={:.2f} from Val): ... F1')"
+    },
+    {
+     "file": "repo-wide grep",
+     "lines": "-",
+     "quote": "grep -rn --exclude-dir=.git -l '45\\.74\\|43\\.85\\|52\\.26\\|48\\.33\\|40\\.66\\|40\\.13' . -> no files"
+    }
+   ],
+   "mechanism": "Test metrics are printed once and discarded, the model files are ignored by git and the W&B project is private; no committed object connects to the two Table 1 rows.",
+   "hurts": [
+    "reproducibility",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "Run the grep above; git check-ignore -v saved_models/x.pth train.log wandb/; diff <(git show f633e44:run.py | grep -n 'SWEEP SUMMARY') <(grep -n 'SWEEP SUMMARY' run.py).",
+   "suggested_fix": "Write test metrics, chosen threshold, config, git SHA and checkpoint hash to a committed results/ JSON; commit W&B run IDs; restore the sweep summary to disk."
+  },
+  {
+   "id": "M37",
+   "title": "Test mode and README cannot find the checkpoints training writes; hybrid and baseline share one checkpoint/plot filename; HEAD's model shape cannot load thesis-era checkpoints",
+   "category": "bug",
+   "severity": "major",
+   "claim": "[provenance-05; filename collision also noted in trainloop-06] Training saves bert_rgcn_bs{bs}_lr{lr}_br{ratio}.pth, but -mode test resolves -path <dir> (or no path) to <dir>/bert_rgcn.pth, which is never written; every README test command names a non-existent file or script (bertggcn.pth, bert_rgcn_bs16_lr1e-04.pth without _br, main.py). The filename and plot_prefix omit model_type, so a baseline run with the same bs/lr/ratio overwrites the hybrid's .pth and PNGs (as plots_codebert_first and plots_Elevneth were configured). HEAD's BertRGCN (hidden 768, context_attn) cannot load_state_dict a thesis-era (hidden 200) checkpoint.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "997-1017, 1395-1398, 1449, 1458",
+     "quote": "def _resolve_save_path(user_path, default_dir=\"./saved_models\", filename=\"bert_rgcn.pth\") ... filename=f\"bert_rgcn_bs{batch_size}_lr{lr_str}_br{ratio_str}.pth\" ... SAVE_PATH = _resolve_save_path(args.path, filename=\"bert_rgcn.pth\") ... model_test.load_state_dict(torch.load(str(SAVE_PATH), ...))"
+    },
+    {
+     "file": "/home/user/Graduation_Project/README.md",
+     "lines": "43, 63, 70, 131, 148, 218",
+     "quote": "-path ./data/model/bertggcn.pth / ...bert_rgcn_bs16_lr1e-04.pth / python main.py --cpg ... (no main.py exists)"
+    }
+   ],
+   "mechanism": "torch.load raises FileNotFoundError unless the caller types the full sweep filename, which no documentation shows; a later run of the other model type into the same -path overwrites the earlier checkpoint (strict load_state_dict fails loudly on the wrong architecture, so Table 1 cannot silently mix models, but a checkpoint can be lost and retrained under different randomness).",
+   "hurts": [
+    "reproducibility",
+    "comparison_validity"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "Read run.py:997-1017 and 1449; ls saved_models after a sweep shows only *_br*.pth; git diff f633e44 HEAD -- models/LMGNN.py | grep -n 'context_attn\\|hidden_dim = self.func_encoder.hidden_size'.",
+   "suggested_fix": "Explicit --ckpt for test mode; include model_type and git SHA in checkpoint and plot names; fix README to reference run.py and real filenames."
+  },
+  {
+   "id": "M38",
+   "title": "Plot directories are hand-named snapshots of a fixed ./plots with identical filenames; which architecture each 200-epoch run used is unrecoverable, except that plots_codebert_first is identifiable as the CodeBERT-only baseline by its zero gate curve",
+   "category": "reproducibility",
+   "severity": "major",
+   "claim": "[provenance-07] All runs write to PLOT_DIR='./plots' with filenames encoding only bs/lr/ratio (no model type, variant, date, seed or SHA); the student renamed the directory between runs. Four directories (plots_Elevneth, plots_12, plots_codebert_first, plots_selfatention) hold bs16_lr1e-04_br0p30 runs with weights curves and qualitatively different outcomes (F2). The flat 0.0 gate curve identifies plots_codebert_first as a CodeBERTOnly run (the code adds 0.0 for models without .fusion), the baseline row's only trace; 'Elevneth' vs '12' vs 'selfatention' cannot be mapped to code. All 14 plots* dirs were added in one commit, so mtimes and run order are lost.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "62, 1411",
+     "quote": "PLOT_DIR = Path(\"./plots\") ... plot_prefix = f\"val_bs{batch_size}_lr{lr_str}_br{ratio_str}_ep{epoch}\""
+    },
+    {
+     "file": "/tmp/claude-0/-home-user/0e009902-f067-59a1-a213-2f219c3fbea3/scratchpad/thesis_era/run.py",
+     "lines": "389-392",
+     "quote": "else:\n    # CodeBERTOnlyの場合などは重みがないので適当な値あるいは0を入れる\n    total_w_code += 0.0"
+    },
+    {
+     "file": "git log --diff-filter=A -- 'plots*'",
+     "lines": "-",
+     "quote": "all 14 plots* directories first added in 72d02e9 (2026-02-17)"
+    }
+   ],
+   "mechanism": "The only provenance is the directory name chosen by hand after the run; the thesis cannot show that Figure 2 ('Elevneth') is representative rather than a selected run, given that '12' with identical hyper-parameters shows gate oscillation.",
+   "hurts": [
+    "reproducibility",
+    "thesis_text"
+   ],
+   "bears_on": "code",
+   "confidence": 0.85,
+   "how_to_verify": "ls plots_Elevneth plots_12 plots_codebert_first plots_selfatention | sort | uniq -c | sort -rn | head; open plots_codebert_first/weights_curve_*.png; grep -n PLOT_DIR run.py.",
+   "suggested_fix": "Name output directories from (git SHA, model_type, hyper-parameters, seed, timestamp) and write a run.json manifest into each."
+  },
+  {
+   "id": "M39",
+   "title": "CPG generation is not reproducible: graph-for-funcs.sc is absent, the Joern version is unpinned, and the only committed Joern script is a different AST-only exporter",
+   "category": "reproducibility",
+   "severity": "major",
+   "claim": "[provenance-10] utils/process/cpg_generator.py runs joern-cli with graph-for-funcs.sc from the joern dir, but that script is not in the repo (joern/ holds only joern-install.sh, which installs the latest release by default: JOERN_DEFAULT_VERSION=\"\"). The committed data/data_for_checking/bin_to_json.sc is a different, AST-only exporter, so the real CPG JSON format can only be inferred from the 5-row cpg_head_check.json.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/utils/process/cpg_generator.py",
+     "lines": "29, 64",
+     "quote": "graph_script = (Path(joern_path).expanduser().resolve() / \"graph-for-funcs.sc\").resolve()"
+    },
+    {
+     "file": "joern/",
+     "lines": "ls; find . -name '*.sc'",
+     "quote": "joern-install.sh only; ./data/data_for_checking/bin_to_json.sc only"
+    },
+    {
+     "file": "joern/joern-install.sh",
+     "lines": "81",
+     "quote": "JOERN_DEFAULT_VERSION=\"\"   (empty -> downloads latest release)"
+    }
+   ],
+   "mechanism": "Without the exact script and Joern version nobody can regenerate the AST/CFG/PDG JSON that feeds cpg.py and embeddings.py; newer Joern releases changed the scripting DSL, so even the Devign-lineage script may not run. The whole input pipeline up to *_input.pkl is unreproducible independent of the training code; also blocks auditing M20 and M24.",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "grep -rn 'graph-for-funcs' . ; find . -name '*.sc' -not -path './.git/*'; sed -n 75,90p joern/joern-install.sh.",
+   "suggested_fix": "Commit graph-for-funcs.sc with its licence, pin JOERN_VERSION, and commit a tiny end-to-end sample (.c -> JSON -> pkl) as a regression fixture."
+  },
+  {
+   "id": "M40",
+   "title": "requirements.txt was written after the experiments and contradicts the student's own committed pip log; a fresh install would not match the thesis environment",
+   "category": "reproducibility",
+   "severity": "major",
+   "claim": "[provenance-11] requirements.txt first appears in 72d02e9 (2026-02-17) and pins torch==2.5.1, numpy==1.26.4, accelerate==1.8.1, psutil==7.0.0, but the accidentally committed pip log '=0.26.0' (5f0658a, 2025-11-15) shows the project venv had torch 2.6.0, numpy 2.1.2, accelerate 1.11.0, psutil 7.1.3. The file also lists unrelated RL packages (agilerl, gymnasium, pygame, SuperSuit, minari, deepspeed, jax), omits pyvis, and comments out torch_scatter/sparse; junk artefacts (=0.26.0, =5.3.0, cuda-keyring_1.1-1_all.deb) are tracked.",
+   "evidence": [
+    {
+     "file": "git log -- requirements.txt",
+     "lines": "-",
+     "quote": "72d02e9 2026-02-17 sss   (only commit touching it)"
+    },
+    {
+     "file": "=0.26.0",
+     "lines": "2-7",
+     "quote": "Downloading accelerate-1.11.0 ... numpy ... (2.1.2) ... psutil ... (7.1.3) ... torch>=2.0.0 ... (2.6.0)"
+    },
+    {
+     "file": "requirements.txt",
+     "lines": "1, 84, 97, 140-145",
+     "quote": "accelerate==1.8.1 / numpy==1.26.4 / psutil==7.0.0 / torch==2.5.1 torch-geometric==2.7.0 #torch_scatter==2.1.2+pt25cu124 ..."
+    }
+   ],
+   "mechanism": "The pinned file is a freeze of some other environment taken months after the runs; torch 2.5 vs 2.6 and numpy 1.x vs 2.x differences change numerics and may break the pickled *_input.pkl, and a reproducer would still fail on the missing pyvis import (M17).",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "git log --format='%h %ad' -- requirements.txt; grep -n 'torch>=2.0.0\\|numpy>=1.17\\|accelerate-' '=0.26.0'; grep -n '^torch==\\|^numpy==' requirements.txt; grep -ci pyvis requirements.txt.",
+   "suggested_fix": "Regenerate requirements from the actual experiment venv; add pyvis/wandb/seaborn; remove RL packages and junk files; record CUDA/driver versions."
+  },
+  {
+   "id": "M41",
+   "title": "W&B metadata can mislabel the dataset: project hard-coded 'graduation-project-six', config dataset defaults to 'six', while training reads whatever is in data/input",
+   "category": "design_choice",
+   "severity": "minor",
+   "claim": "[provenance-12] wandb.init logs config['dataset']=args.dataset (default 'six') under a hard-coded project name, but --dataset only selects jsonl paths for CPG generation; training/validation loaders read {split}_*_input.pkl from PATHS.input regardless (README:286 says so). A BigVul training run launched without --dataset bigvul is recorded as 'six'; wandb is imported and initialised unconditionally.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "1023-1027, 1121-1125, 1304-1314",
+     "quote": "all_files = data.get_directory_files(PATHS.input) ... '--dataset', choices=[...], default='six' ... wandb.init(project=\"graduation-project-six\", ... \"dataset\": args.dataset"
+    },
+    {
+     "file": "/home/user/Graduation_Project/README.md",
+     "lines": "286",
+     "quote": "訓練のコマンドでデータセットを指定しても意味ない。ここでは、直近に作られたcpgとembedで使ったデータセットをつかう。"
+    }
+   ],
+   "mechanism": "The only machine-readable record of which dataset trained a run is a CLI default unrelated to the data on disk; the dataset behind the three 200-epoch runs is asserted by the thesis, not recorded.",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.8,
+   "how_to_verify": "grep -n 'args.dataset' run.py; sed -n 1023,1027p run.py.",
+   "suggested_fix": "Write the dataset name into the *_input.pkl manifest and derive the W&B config from it."
+  },
+  {
+   "id": "M42",
+   "title": "The 'primevul' dataset branch points valid and test at the train jsonl (would leak), but there is no evidence it was ever used",
+   "category": "bug",
+   "severity": "minor",
+   "claim": "[provenance-13] run.py:1185-1188 sets valid_path and test_path to primevul_defect_train.jsonl; these feed only CPG_generator. No plots directory, README example or artefact mentions PrimeVul and the thesis evaluates BigVul only. Latent bug; does not touch Table 1.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "1185-1188",
+     "quote": "elif args.dataset == 'primevul':\n    train_path = \".../primevul_defect_train.jsonl\"\n    valid_path = \".../primevul_defect_train.jsonl\"\n    test_path = \".../primevul_defect_train.jsonl\""
+    }
+   ],
+   "mechanism": "If -cpg were run with --dataset primevul, valid and test would be shuffled copies of train and metrics would be inflated; all evidence says it was not.",
+   "hurts": [],
+   "bears_on": "neither",
+   "confidence": 0.7,
+   "how_to_verify": "sed -n 1185,1188p run.py; git ls-files | grep -i primevul; grep -rn primevul README.md.",
+   "suggested_fix": "Point valid/test at the valid/test jsonl or remove the branch."
+  },
+  {
+   "id": "M43",
+   "title": "results.txt is a Devign-era artefact (197-row qemu/DiverseVul test split, 25.9% positive) written by code HEAD never calls",
+   "category": "reproducibility",
+   "severity": "minor",
+   "claim": "[provenance-14] results.txt (added 53f3a0a, 2025-11-08) has 197 rows with 51 positives; data/splits/split.json from the same era has test=197 of 1955 and configs.json then filtered DiverseVul to project qemu. It is written by test.py:71, but run.py's `from test import test` is shadowed by its own def test (line 695) and neither is called. It has no relation to BigVul or Table 1.",
+   "evidence": [
+    {
+     "file": "results.txt",
+     "lines": "1-198",
+     "quote": "# True label, Predicted label, Predicted Probability ... rows 197, true_pos 51, pos_rate 0.2589"
+    },
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "30, 695",
+     "quote": "from test import test  /  def test(model, test_loader, plot_prefix: str = \"test\"):"
+    }
+   ],
+   "mechanism": "A reader may take a 26%-positive prediction dump at the repo root for BigVul output of the thesis model; it is the reproduced Vul-LMGNN/Devign-lineage model on a 1,955-function qemu subset.",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "neither",
+   "confidence": 0.9,
+   "how_to_verify": "awk 'NR>1{n++;if($1==1)p++}END{print n,p,p/n}' results.txt; git log --diff-filter=A --format='%h %ad %s' -- results.txt.",
+   "suggested_fix": "Delete or archive results.txt, test.py and data/splits/split.json with a README."
+  },
+  {
+   "id": "M44",
+   "title": "Dead and duplicated code paths obscure what actually runs (two test(), unused cpg_dir alias, BalancedStreamDataset, Conv/conv_args, legacy Net, unused config keys)",
+   "category": "reproducibility",
+   "severity": "minor",
+   "claim": "[provenance-15] run.py imports test from test.py then redefines test (both unused); imports utils.functions.cpg_dir as cpg 'because it is referenced' but never uses it; defines BalancedStreamDataset and imports BalancedBatcher, loads/train_val_test_split and WeightedRandomSampler without using them; passes Conv into BertRGCN which never uses Conv or conv_args, so configs.json's conv_args and the legacy Net class are dead; configs.json process.patience/dataset_ratio are ignored.",
+   "evidence": [
+    {
+     "file": "/home/user/Graduation_Project/run.py",
+     "lines": "11, 21, 24, 29-30, 35, 98, 695",
+     "quote": "import utils.functions.cpg_dir as cpg  # 参照されているので残す / from utils.data.datamanager import loads, train_val_test_split  # 互換のため残す（未使用） / class BalancedStreamDataset(IterableDataset): / def test(model, test_loader, ...)"
+    },
+    {
+     "file": "/home/user/Graduation_Project/models/layers.py",
+     "lines": "37, 90",
+     "quote": "class Conv(nn.Module): / class Net(nn.Module):   (no instantiation anywhere)"
+    }
+   ],
+   "mechanism": "None of these change the numbers, but which loader, loss and evaluation path produced Table 1 cannot be told without tracing execution, and several comments assert the opposite of the truth.",
+   "hurts": [
+    "reproducibility"
+   ],
+   "bears_on": "code",
+   "confidence": 0.9,
+   "how_to_verify": "ruff --select F401,F811 run.py; grep -n '\\bcpg\\.' run.py; grep -rn 'Net(' --include=*.py .",
+   "suggested_fix": "Remove dead imports/classes and unused config keys; keep one evaluation function."
+  },
+  {
+   "id": "M45",
+   "title": "Published same-backbone fusion gains are 0.1-3 F1 (Vul-LMGNN, DeepDFA+LineVul); a single-run -1.9 lies inside that band and cannot distinguish 'implementation defect' from 'idea has ~zero effect here'",
+   "category": "idea_limitation",
+   "severity": "major",
+   "claim": "[literature-1] Vul-LMGNN (the direct ancestor of this repository, F9) with CodeBERT as backbone gains +0.10 (DiverseVul), +0.63 (Devign), +1.48 (VDSIC) F1 over CodeBERT alone, and +13 only on the 1,664-positive ReVeal set; DeepDFA+LineVul, the strongest published graph+LM fusion on Big-Vul, gains +3.17 over LineVul on the random split (93.23 -> 96.40) and +0.51 cross-project. The effect size the thesis tries to detect is therefore 0-3 F1, the same order as seed noise (M03).",
+   "evidence": [
+    {
+     "file": "https://arxiv.org/abs/2404.14719 (vullmgnn.txt)",
+     "lines": "806-850",
+     "quote": "CodeBert 23.44 vs Vul-LMGNNs(C-B) 23.54 (DiverseVul) ... 59.53 vs 60.16 (Devign) ... 38.19 vs 51.22 (ReVeal)"
+    },
+    {
+     "file": "https://arxiv.org/html/2212.08108v3",
+     "lines": "Table 3 and Table 7",
+     "quote": "LineVul 93.23 (0.31) ... DeepDFA+LineVul 96.40 (0.13); cross-project: LineVul 71.37, DeepDFA+LineVul 71.88"
+    },
+    {
+     "file": "thesis Table 1",
+     "lines": "p.6",
+     "quote": "CodeBERT 45.74 ... Proposed (Hybrid) 43.85"
+    }
+   ],
+   "mechanism": "A -1.89 from one run is a sample from a distribution whose published mean is 0-3 and whose seed std is ~3, not a diagnosis; the expected result of a correct implementation of this design on random-split BigVul is a hybrid within about -1 to +3 F1 of its own CodeBERT baseline.",
+   "hurts": [
+    "comparison_validity",
+    "thesis_text"
+   ],
+   "bears_on": "idea",
+   "confidence": 0.85,
+   "how_to_verify": "Subtract the CodeBert row from Vul-LMGNNs(C-B) per dataset in arXiv 2404.14719 Tables 2-3; compare LineVul vs DeepDFA+LineVul in arXiv 2212.08108v3 Tables 3 and 7.",
+   "suggested_fix": "Report the result as 'no detectable effect at this sample size'; if continued, pre-register a minimum detectable effect and run >= 3 seeds per arm."
+  },
+  {
+   "id": "M46",
+   "title": "The thesis's two motivating citations (GALLa, EFVD) do not predict a fusion gain on Big-Vul",
+   "category": "methodology",
+   "severity": "minor",
+   "claim": "[literature-6] §2.3 cites GALLa [3] and EFVD [4] as hybrids that 'combine structural and semantic features to improve vulnerability detection performance', but GALLa discards the graph encoder at inference and reports defect-detection accuracy changes of -0.9 to +2.9 points (and -5.8 in single-task fine-tuning, 'even a large drop on the C defect detection task') on CodeXGLUE/Devign; EFVD's headline is a maximum relative improvement over the weakest baseline on unnamed datasets (full text not accessible, HTTP 403). Neither provides a same-backbone CodeBERT-vs-fusion delta on Big-Vul.",
+   "evidence": [
+    {
+     "file": "https://arxiv.org/abs/2409.04183 (galla.txt)",
+     "lines": "318-321, 445-447",
+     "quote": "at inference time the graph encoder and adapter are discarded ... GraphQA brings limited improvement, and even a large drop on the C defect detection task"
+    },
+    {
+     "file": "https://doi.org/10.1145/3732365.3732421 (abstract)",
+     "lines": "abstract",
+     "quote": "EFVD achieves a maximum absolute improvement of 35.63% in accuracy and 289.32% in F1 scores over the three publicly available benchmark datasets."
+    }
+   ],
+   "mechanism": "The prior the thesis should have formed from its own citations is 'small or no gain', so the observed result is the expected one rather than a surprise requiring an optimisation-difficulty explanation.",
+   "hurts": [
+    "thesis_text"
+   ],
+   "bears_on": "idea",
+   "confidence": 0.8,
+   "how_to_verify": "Read GALLa Sec. 3.2.3 and Table 3 'Defect' column; read the EFVD abstract and, if reachable, identify the baseline behind the 289.32%.",
+   "suggested_fix": "Rewrite §2.3 to cite Vul-LMGNN and DeepDFA with their actual same-backbone deltas and frame the expected effect size accordingly."
+  }
+ ]
+}
