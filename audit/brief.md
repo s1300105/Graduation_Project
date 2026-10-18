@@ -116,3 +116,8 @@ by which it changes the numbers, which side it hurts, your confidence, and how a
 Separate clearly: (a) bugs, (b) design/implementation choices that plausibly caused the failure,
 (c) thesis-vs-code discrepancies, (d) methodology/statistics problems, (e) limitations of the idea itself.
 Prefer fewer, well-evidenced findings over speculation. Do not pad.
+
+
+## Erratum (added after verification)
+
+F8 describes HEAD only. The thesis-era code (f633e44) ran `search_best_threshold` on validation every epoch and saved / early-stopped on the threshold-tuned F1 with a +1e-4 margin (verified by the M05 code-trace verifier). HEAD switched to F1 at threshold 0.5.
